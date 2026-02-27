@@ -8,15 +8,6 @@ export default {
       // eslint-disable-next-line no-console
       console.log("[custom-sso] initializer loaded");
 
-      // 通过 DI 读到站点设置（包括插件自定义的设置）
-      let siteSettings = null;
-      try {
-        siteSettings = api.container.lookup("site-settings:main");
-      } catch (e) {
-        // eslint-disable-next-line no-console
-        console.warn("[custom-sso] failed to lookup site-settings", e);
-      }
-
       function insertSsoButton() {
         // 已经有就不重复插
         if (document.querySelector(".custom-sso-btn")) {
@@ -41,9 +32,10 @@ export default {
           e.preventDefault();
           e.stopPropagation();
 
-          // 跳转到 Discourse 后端的 /custom-sso/login，
-          // 后端会重定向到认证中心登录页（custom_sso_login_url）。
-          // 用户在认证中心登录后进入门户，在门户点击"进入系统"才回到 Discourse。
+          // 跳转到 /custom-sso/login，后端会直接构造 OAuth authorize URL
+          // 跳转到认证中心。如果用户未登录，认证中心会展示登录页面；
+          // 登录成功后认证中心带 code 回调到 /custom-sso/callback，
+          // 全程不经过门户 portal 页面。
           const loginPath = window.location.origin + "/custom-sso/login";
           // eslint-disable-next-line no-console
           console.log("[custom-sso] navigating to", loginPath);
