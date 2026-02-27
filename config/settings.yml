@@ -2,34 +2,21 @@ plugins:
   custom_sso_enabled:
     default: true
     client: true
-  custom_sso_login_url:
-    default: "https://192.168.50.192:30443/login"
-    client: true   # 前端按钮跳转的统一认证登录页
   custom_sso_discourse_base_url:
     default: ""
-    client: true   # 反向代理不转 /custom_sso 时，用真实 Discourse 主机
-  custom_sso_idp_initiated_enabled:
-    default: false
-    client: true   # 允许 IdP 发起（门户直接带 token 打开 Discourse）
-  custom_sso_idp_jwt_secret:
-    default: ""
-    client: false  # 门户签发 token 的对称密钥（HS256）
-  custom_sso_idp_issuer:
-    default: ""
-    client: false  # 门户签发 token 的 iss 值，用来校验
+    client: false  # Discourse 对外可访问的基础 URL（反向代理场景需要配置）
   custom_sso_authorize_url:
     default: ""
     client: false  # OAuth2 授权端点，如 https://192.168.50.192:30443/oauth2/authorize
-  # 以下是 OAuth 配置
   custom_sso_token_url:
     default: ""
-    client: false
+    client: false  # OAuth2 Token 端点，如 https://192.168.50.192:30443/oauth2/token
   custom_sso_user_info_url:
     default: ""
-    client: false
+    client: false  # OAuth2 用户信息端点，如 https://192.168.50.192:30443/userinfo
   custom_sso_client_id:
     default: ""
-    client: false
+    client: false  # OAuth2 客户端 ID
   custom_sso_client_secret:
     default: ""
-    client: false
+    client: false  # OAuth2 客户端密钥
