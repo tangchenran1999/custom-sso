@@ -61,6 +61,8 @@ class CustomSsoController < ::ApplicationController
     state = SecureRandom.hex(16)
     session[:custom_sso_state] = state
 
+    Rails.logger.info("CustomSSO: login — discourse_base=#{discourse_base}, callback_url=#{callback_url}")
+
     sep = authorize_url.include?("?") ? "&" : "?"
     full_url = "#{authorize_url}#{sep}" \
       "response_type=code" \
@@ -89,6 +91,8 @@ class CustomSsoController < ::ApplicationController
   def callback
     Rails.logger.info("CustomSSO: ========== callback action entered ==========")
     Rails.logger.info("CustomSSO: request format=#{request.format}, xhr=#{request.xhr?}, method=#{request.method}")
+    Rails.logger.info("CustomSSO: request url=#{request.original_url}")
+    Rails.logger.info("CustomSSO: discourse_base=#{discourse_base}")
     Rails.logger.info("CustomSSO: params=#{params.to_unsafe_h.except(:code).inspect}")
 
     code  = params[:code].to_s.strip
@@ -268,25 +272,33 @@ class CustomSsoController < ::ApplicationController
 
   def exchange_code_for_token(code, token_url)
     callback_url  = "#{discourse_base}/custom-sso/callback"
-    client_id     = SiteSetting.custom_sso_client_id.to_s
-    client_secret = SiteSetting.custom_sso_client_secret.to_s
+    client_id     = SiteSetting.custom_sso_client_id.to_s.strip
+    client_secret = SiteSetting.custom_sso_client_secret.to_s.strip
 
     uri = URI.parse(token_url)
     is_ssl = (uri.scheme == "https")
 
     Rails.logger.info("CustomSSO: exchanging code for token at #{token_url} (ssl=#{is_ssl})")
+    Rails.logger.info("CustomSSO: redirect_uri=#{callback_url}, client_id=#{client_id}")
 
     response = Net::HTTP.start(uri.host, uri.port, use_ssl: is_ssl, verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
       request = Net::HTTP::Post.new(uri.request_uri)
+      request.content_type = "application/x-www-form-urlencoded"
+
+      # Spring Authorization Server 默认使用 client_secret_basic 认证方式
+      # 即通过 HTTP Basic Auth 传递 client_id 和 client_secret
+      request.basic_auth(client_id, client_secret)
+
       request.set_form_data(
-        "grant_type"    => "authorization_code",
-        "code"          => code,
-        "redirect_uri"  => callback_url,
-        "client_id"     => client_id,
-        "client_secret" => client_secret
+        "grant_type"   => "authorization_code",
+        "code"         => code,
+        "redirect_uri" => callback_url
       )
       http.request(request)
     end
+
+    Rails.logger.info("CustomSSO: token response status=#{response.code}")
+    Rails.logger.info("CustomSSO: token response body=#{response.body}")
 
     unless response.is_a?(Net::HTTPSuccess)
       Rails.logger.error("CustomSSO: token exchange failed — #{response.code} #{response.message}")
