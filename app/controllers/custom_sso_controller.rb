@@ -9,6 +9,7 @@ class CustomSsoController < ::ApplicationController
   require "json"
   require "openssl"
   require "uri"
+  require "base64"
 
   # ── 跳过所有可能阻止匿名访问的 before_action ──────────
   # 这些路由必须对未登录用户开放（OAuth 回调时用户尚未在 Discourse 登录）
@@ -121,15 +122,31 @@ class CustomSsoController < ::ApplicationController
 
     begin
       access_token = exchange_code_for_token(code, token_url)
-      user_info    = fetch_user_info(access_token, user_info_url)
 
-      username = user_info["username"] || user_info[:username] ||
-                 user_info["account"]  || user_info[:account]  ||
-                 user_info["login"]    || user_info[:login]    ||
-                 user_info["sub"]      || user_info[:sub]
-      email    = user_info["email"]    || user_info[:email]
-      name     = user_info["name"]     || user_info[:name]     ||
-                 user_info["display_name"] || user_info[:display_name] ||
+      # ── 优先从 JWT access_token 中解析用户信息 ──────────
+      # Spring Authorization Server 的 access_token 是 JWT，
+      # 包含 sub, account, realName, userId, authorities 等 claims。
+      # /userinfo 端点可能只返回 sub，信息不全，所以优先用 JWT。
+      jwt_claims = decode_jwt_payload(access_token)
+      Rails.logger.info("CustomSSO: JWT claims: #{jwt_claims.inspect}")
+
+      # 也尝试从 /userinfo 获取补充信息
+      user_info = {}
+      begin
+        user_info = fetch_user_info(access_token, user_info_url)
+      rescue => e
+        Rails.logger.warn("CustomSSO: userinfo fetch failed (non-fatal): #{e.message}")
+      end
+
+      # 合并 JWT claims 和 userinfo，JWT 优先
+      merged = user_info.merge(jwt_claims) { |_key, ui_val, jwt_val| jwt_val.present? ? jwt_val : ui_val }
+
+      username = merged["account"]  || merged["username"] ||
+                 merged["login"]    || merged["sub"]       ||
+                 merged["preferred_username"]
+      email    = merged["email"]
+      name     = merged["realName"] || merged["real_name"] ||
+                 merged["name"]     || merged["display_name"] ||
                  username
 
       Rails.logger.info("CustomSSO: got user info — email=#{email}, username=#{username}, name=#{name}")
@@ -165,7 +182,8 @@ class CustomSsoController < ::ApplicationController
       end
 
       log_on_user(existing_user)
-      redirect_to "/"
+      Rails.logger.info("CustomSSO: log_on_user done for #{existing_user.username}, redirecting to #{discourse_base}")
+      redirect_to "#{discourse_base}/", allow_other_host: true
     else
       # ── 新用户：首次登录，需要补全邮箱和设置密码 ────────
       Rails.logger.info("CustomSSO: new user detected — username=#{normalized_username}, redirecting to complete profile")
@@ -254,7 +272,7 @@ class CustomSsoController < ::ApplicationController
       session.delete(:sso_pending_email)
 
       log_on_user(user)
-      redirect_to "/"
+      redirect_to "#{discourse_base}/", allow_other_host: true
     rescue => e
       Rails.logger.error("CustomSSO: failed to create user: #{e.class} #{e.message}")
       render html: complete_profile_html(username, name, email, "创建用户失败: #{e.message}").html_safe, layout: false
@@ -319,6 +337,24 @@ class CustomSsoController < ::ApplicationController
   rescue JSON::ParserError => e
     Rails.logger.error("CustomSSO: failed to parse token response: #{e.message}")
     raise "Token 响应解析失败: #{e.message}"
+  end
+
+  # 解析 JWT 的 payload 部分（不验证签名，仅提取 claims）
+  # Spring Authorization Server 的 access_token 是 JWT，
+  # 包含 sub, account, realName, userId 等自定义 claims
+  def decode_jwt_payload(token)
+    parts = token.to_s.split(".")
+    return {} unless parts.length == 3
+
+    # JWT payload 是 Base64url 编码的
+    payload_b64 = parts[1]
+    # 补齐 Base64 padding
+    payload_b64 += "=" * (4 - payload_b64.length % 4) if payload_b64.length % 4 != 0
+    payload_json = Base64.urlsafe_decode64(payload_b64)
+    JSON.parse(payload_json)
+  rescue => e
+    Rails.logger.warn("CustomSSO: failed to decode JWT payload: #{e.message}")
+    {}
   end
 
   def fetch_user_info(access_token, user_info_url)
