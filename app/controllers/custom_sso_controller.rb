@@ -424,3 +424,4 @@ class CustomSsoController < ::ApplicationController
     "#{base}_#{SecureRandom.hex(4)}"
   end
 end
+
