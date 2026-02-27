@@ -11,16 +11,21 @@ class CustomSsoController < ::ApplicationController
   require "uri"
 
   # ── 跳过所有可能阻止匿名访问的 before_action ──────────
+  # 这些路由必须对未登录用户开放（OAuth 回调时用户尚未在 Discourse 登录）
   skip_before_action :verify_authenticity_token
   skip_before_action :check_xhr
   skip_before_action :redirect_to_login_if_required
-  skip_before_action :ensure_logged_in,          raise: false
-  skip_before_action :block_if_requires_login,   raise: false
-  skip_before_action :check_site_read_only,      raise: false
-  skip_before_action :handle_theme_hierarchies,  raise: false
-  skip_before_action :block_if_readonly_mode,    raise: false
-  skip_before_action :preload_json,              raise: false
+  skip_before_action :ensure_logged_in,            raise: false
+  skip_before_action :block_if_requires_login,     raise: false
+  skip_before_action :check_site_read_only,        raise: false
+  skip_before_action :handle_theme_hierarchies,    raise: false
+  skip_before_action :block_if_readonly_mode,      raise: false
+  skip_before_action :preload_json,                raise: false
+  skip_before_action :force_https,                 raise: false
+  skip_before_action :check_restricted_access,     raise: false
+  skip_before_action :block_if_maintenance_mode,   raise: false
 
+  # 允许匿名访问（Discourse 内部检查）
   def self.allows_anonymous?
     true
   end
@@ -82,6 +87,10 @@ class CustomSsoController < ::ApplicationController
   #                    跳转到补全信息页面
   # ──────────────────────────────────────────────────────────
   def callback
+    Rails.logger.info("CustomSSO: ========== callback action entered ==========")
+    Rails.logger.info("CustomSSO: request format=#{request.format}, xhr=#{request.xhr?}, method=#{request.method}")
+    Rails.logger.info("CustomSSO: params=#{params.to_unsafe_h.except(:code).inspect}")
+
     code  = params[:code].to_s.strip
     state = params[:state].to_s.strip
 
@@ -92,7 +101,8 @@ class CustomSsoController < ::ApplicationController
 
     if code.blank?
       Rails.logger.error("CustomSSO: callback missing code param")
-      raise Discourse::InvalidAccess, "缺少授权码 (code)"
+      render plain: "缺少授权码 (code)，请重新登录", status: 400
+      return
     end
 
     # ── 用 code 换 token，再获取用户信息 ──────────────────
@@ -101,7 +111,8 @@ class CustomSsoController < ::ApplicationController
 
     if token_url.blank? || user_info_url.blank?
       Rails.logger.error("CustomSSO: token_url or user_info_url not configured")
-      raise Discourse::InvalidAccess, "OAuth 配置不完整，请配置 token_url 和 user_info_url"
+      render plain: "OAuth 配置不完整，请配置 token_url 和 user_info_url", status: 500
+      return
     end
 
     begin
@@ -121,12 +132,14 @@ class CustomSsoController < ::ApplicationController
     rescue => e
       Rails.logger.error("CustomSSO: OAuth flow failed: #{e.class} #{e.message}")
       Rails.logger.error(e.backtrace.first(10).join("\n"))
-      raise Discourse::InvalidAccess, "获取用户信息失败: #{e.message}"
+      render plain: "获取用户信息失败: #{e.message}", status: 502
+      return
     end
 
     if username.blank?
       Rails.logger.error("CustomSSO: username is blank after OAuth flow")
-      raise Discourse::InvalidAccess, "认证中心未返回用户名"
+      render plain: "认证中心未返回用户名", status: 502
+      return
     end
 
     normalized_username = normalize_username(username)
@@ -192,7 +205,8 @@ class CustomSsoController < ::ApplicationController
     name     = session[:sso_pending_name]
 
     if username.blank?
-      raise Discourse::InvalidAccess, "会话已过期，请重新登录"
+      render plain: "会话已过期，请重新登录", status: 400
+      return
     end
 
     email    = params[:email].to_s.strip.downcase
