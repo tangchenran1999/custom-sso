@@ -6,7 +6,7 @@ export default {
   initialize() {
     withPluginApi("1.0.0", (api) => {
       // eslint-disable-next-line no-console
-      console.log("custom-sso initializer loaded");
+      console.log("[custom-sso] initializer loaded");
 
       // 通过 DI 读到站点设置（包括插件自定义的设置）
       let siteSettings = null;
@@ -14,10 +14,7 @@ export default {
         siteSettings = api.container.lookup("site-settings:main");
       } catch (e) {
         // eslint-disable-next-line no-console
-        console.warn(
-          "custom-sso: failed to lookup site-settings",
-          e
-        );
+        console.warn("[custom-sso] failed to lookup site-settings", e);
       }
 
       function insertSsoButton() {
@@ -44,12 +41,12 @@ export default {
           e.preventDefault();
           e.stopPropagation();
 
-          // 直接做全页面跳转到后端 login 路由，
-          // 后端会生成 nonce 并 redirect 到认证中心
-          // 用绝对路径 + origin 确保不被 SPA 路由拦截
+          // 跳转到 Discourse 后端的 /custom-sso/login，
+          // 后端会重定向到认证中心登录页（custom_sso_login_url）。
+          // 用户在认证中心登录后进入门户，在门户点击"进入系统"才回到 Discourse。
           const loginPath = window.location.origin + "/custom-sso/login";
           // eslint-disable-next-line no-console
-          console.log("custom-sso: navigating to", loginPath);
+          console.log("[custom-sso] navigating to", loginPath);
           window.location.replace(loginPath);
         });
 
@@ -57,7 +54,7 @@ export default {
         container.prepend(btn);
 
         // eslint-disable-next-line no-console
-        console.log("custom-sso button inserted");
+        console.log("[custom-sso] button inserted");
       }
 
       // SPA 路由切到 /login 时，尝试插一次
