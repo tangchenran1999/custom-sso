@@ -14,6 +14,7 @@ export default {
       //    解决方案：检测到这种情况后，强制用完整页面导航重新请求。
       const path = window.location.pathname;
       if (
+        path.startsWith("/custom-sso/login") ||
         path.startsWith("/custom-sso/callback") ||
         path.startsWith("/custom-sso/complete-profile") ||
         path.startsWith("/custom-sso/create-account")
