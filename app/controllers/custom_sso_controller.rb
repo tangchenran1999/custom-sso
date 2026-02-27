@@ -10,9 +10,23 @@ class CustomSsoController < ::ApplicationController
   require "openssl"
   require "uri"
 
+  # ── 跳过所有可能阻止匿名访问的 before_action ──────────
+  # SSO 回调必须在用户未登录时也能访问，否则 OAuth 流程会断掉。
+  # raise: false 表示如果该 before_action 不存在也不报错（兼容不同版本）。
   skip_before_action :verify_authenticity_token
   skip_before_action :check_xhr
   skip_before_action :redirect_to_login_if_required
+  skip_before_action :ensure_logged_in,          raise: false
+  skip_before_action :block_if_requires_login,   raise: false
+  skip_before_action :check_site_read_only,      raise: false
+  skip_before_action :handle_theme_hierarchies,  raise: false
+  skip_before_action :block_if_readonly_mode,    raise: false
+  skip_before_action :preload_json,              raise: false
+
+  # 告诉 Discourse 这些 action 允许匿名访问（不需要登录）
+  def self.allows_anonymous?
+    true
+  end
 
   #
   # 1️⃣ 点击「统一身份认证」后进这里
