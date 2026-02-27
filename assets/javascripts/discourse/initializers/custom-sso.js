@@ -6,16 +6,16 @@ export default {
   initialize() {
     withPluginApi("1.0.0", (api) => {
       // eslint-disable-next-line no-console
-      console.log("custom-sso initializer loaded (no widgets)");
+      console.log("custom-sso initializer loaded");
 
-      // 通过 DI 读到站点设置（包括插件自定义的设置），失败就用 null 并走默认值
+      // 通过 DI 读到站点设置（包括插件自定义的设置）
       let siteSettings = null;
       try {
         siteSettings = api.container.lookup("site-settings:main");
       } catch (e) {
         // eslint-disable-next-line no-console
         console.warn(
-          "custom-sso: failed to lookup site-settings, using default login url",
+          "custom-sso: failed to lookup site-settings",
           e
         );
       }
@@ -26,7 +26,7 @@ export default {
           return;
         }
 
-        // 尝试找到登录按钮容器（新版本里一般还是叫 .login-buttons）
+        // 尝试找到登录按钮容器
         const container =
           document.querySelector(".login-buttons") ||
           document.querySelector(".auth-buttons");
@@ -35,27 +35,26 @@ export default {
           return;
         }
 
-        const a = document.createElement("a");
-        a.className = "btn btn-primary custom-sso-btn";
+        const btn = document.createElement("button");
+        btn.className = "btn btn-primary custom-sso-btn";
+        btn.type = "button";
+        btn.textContent = "统一身份认证";
 
-        // 点击按钮先经过插件的登录路由，由后端处理回调URL和nonce
-        a.href = "/custom-sso/login";
-
-        // 调试日志：看看按钮最终 href 是什么
-        // eslint-disable-next-line no-console
-        console.log("custom-sso: final SSO login href =", a.href);
-        a.textContent = "统一身份认证";
-        // 非常关键：禁止 Discourse 的 SPA 自动路由拦截这个链接
-        // 不然它会去请求 /permalink-check.json，而不是直接访问 /custom_sso/login
-        a.setAttribute("data-auto-route", "false");
-        // 兜底：如果某些版本不认 data-auto-route，就手动强制整页跳转
-        a.addEventListener("click", (e) => {
+        btn.addEventListener("click", (e) => {
           e.preventDefault();
-          window.location.href = a.href;
+          e.stopPropagation();
+
+          // 直接做全页面跳转到后端 login 路由，
+          // 后端会生成 nonce 并 redirect 到认证中心
+          // 用绝对路径 + origin 确保不被 SPA 路由拦截
+          const loginPath = window.location.origin + "/custom-sso/login";
+          // eslint-disable-next-line no-console
+          console.log("custom-sso: navigating to", loginPath);
+          window.location.replace(loginPath);
         });
 
         // 放到最前面
-        container.prepend(a);
+        container.prepend(btn);
 
         // eslint-disable-next-line no-console
         console.log("custom-sso button inserted");
