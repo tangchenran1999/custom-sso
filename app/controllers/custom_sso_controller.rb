@@ -66,11 +66,18 @@ class CustomSsoController < ::ApplicationController
     session[:custom_sso_nonce] = nonce
 
     # 确保 session 在重定向前被保存（这对跨域重定向很重要）
-    # 通过访问 session.id 触发 session 的保存机制
-    _ = session.id rescue nil
+    # 通过访问 session.id 和修改 session 来触发保存
+    begin
+      _session_id = session.id
+      # 标记 session 为已修改，确保在重定向前保存
+      session[:custom_sso_timestamp] = Time.now.to_i
+    rescue => e
+      Rails.logger.warn("CustomSSO: session access warning: #{e.message}")
+    end
 
     Rails.logger.info("CustomSSO: login — discourse_base=#{discourse_base}, callback_url=#{callback_url}")
     Rails.logger.info("CustomSSO: session_id=#{session.id rescue 'N/A'}, state=#{state}, nonce=#{nonce}")
+    Rails.logger.info("CustomSSO: session saved state=#{session[:custom_sso_state].inspect}")
 
     # 使用 URI 构建器确保 URL 格式正确
     # 这样可以正确处理已有查询参数，避免重复
@@ -120,6 +127,11 @@ class CustomSsoController < ::ApplicationController
     Rails.logger.info("CustomSSO: request url=#{request.original_url}")
     Rails.logger.info("CustomSSO: discourse_base=#{discourse_base}")
     Rails.logger.info("CustomSSO: params=#{params.to_unsafe_h.except(:code).inspect}")
+    
+    # 详细记录 session 信息
+    Rails.logger.info("CustomSSO: session_id=#{session.id rescue 'N/A'}")
+    Rails.logger.info("CustomSSO: session keys=#{session.keys.inspect}")
+    Rails.logger.info("CustomSSO: session[:custom_sso_state]=#{session[:custom_sso_state].inspect}")
 
     code  = params[:code].to_s.strip
     state = params[:state].to_s.strip
@@ -127,7 +139,7 @@ class CustomSsoController < ::ApplicationController
 
     Rails.logger.info(
       "CustomSSO: callback received — code=#{code.present? ? 'present' : 'missing'}, " \
-      "state=#{state.present? ? 'present' : 'missing'}, " \
+      "state=#{state.present? ? state : 'missing'}, " \
       "nonce=#{nonce.present? ? 'present' : 'missing'}"
     )
 
@@ -139,7 +151,22 @@ class CustomSsoController < ::ApplicationController
 
     # 验证 state（防止 CSRF 攻击）
     expected_state = session[:custom_sso_state]
-    if state.blank? || state != expected_state
+    Rails.logger.info("CustomSSO: state validation — expected=#{expected_state.inspect}, received=#{state.inspect}, match=#{state == expected_state}")
+    
+    if state.blank?
+      Rails.logger.error("CustomSSO: state is blank in callback")
+      render plain: "授权状态验证失败：回调中缺少 state 参数，请重新登录", status: 400
+      return
+    end
+    
+    if expected_state.blank?
+      Rails.logger.error("CustomSSO: expected_state is blank in session — session may have been lost")
+      Rails.logger.error("CustomSSO: This usually means session was lost during cross-domain redirect")
+      render plain: "授权状态验证失败：会话已丢失，请重新登录", status: 400
+      return
+    end
+    
+    if state != expected_state
       Rails.logger.error("CustomSSO: state mismatch — expected=#{expected_state}, got=#{state}")
       render plain: "授权状态验证失败，请重新登录", status: 400
       return
