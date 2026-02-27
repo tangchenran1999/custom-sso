@@ -11,7 +11,6 @@ class CustomSsoController < ::ApplicationController
   require "uri"
 
   # ── 跳过所有可能阻止匿名访问的 before_action ──────────
-  # SSO 回调必须在用户未登录时也能访问，否则 OAuth 流程会断掉。
   skip_before_action :verify_authenticity_token
   skip_before_action :check_xhr
   skip_before_action :redirect_to_login_if_required
@@ -22,159 +21,22 @@ class CustomSsoController < ::ApplicationController
   skip_before_action :block_if_readonly_mode,    raise: false
   skip_before_action :preload_json,              raise: false
 
-  # 告诉 Discourse 这些 action 允许匿名访问（不需要登录）
   def self.allows_anonymous?
     true
   end
 
   # ──────────────────────────────────────────────────────────
-  # 1️⃣  /custom-sso/login
+  # 1️⃣  GET /custom-sso/login
   #
   #    Discourse 登录页上的「统一身份认证」按钮会跳到这里。
-  #    这里的职责很简单：把用户重定向到认证中心的登录页。
+  #    直接构造 OAuth 2.0 Authorization Code 请求，
+  #    跳转到认证中心的 authorize 端点。
   #
-  #    完整流程：
-  #      Discourse 登录页 → /custom-sso/login
-  #        → 认证中心登录页 (custom_sso_login_url)
-  #        → 用户登录成功 → 进入门户 (/portal)
-  #        → 用户点击"进入系统" → 门户后端 buildLaunchUrl()
-  #        → OAuth authorize URL（redirect_uri = /custom-sso/callback）
-  #        → 认证中心自动授权（已登录）→ 302 回 /custom-sso/callback?code=xxx
-  #        → Discourse callback 处理 → 登录用户 → 跳转首页
+  #    如果用户未在认证中心登录，认证中心会自动展示登录页面；
+  #    登录成功后认证中心会带 code 回调到 /custom-sso/callback。
+  #    全程不经过门户 portal 页面。
   # ──────────────────────────────────────────────────────────
   def login
-    login_url = SiteSetting.custom_sso_login_url.to_s.strip
-
-    if login_url.blank?
-      Rails.logger.error("CustomSSO: custom_sso_login_url is blank! Please configure it in admin settings.")
-      render plain: "统一认证登录地址未配置，请在后台设置 custom_sso_login_url", status: 500
-      return
-    end
-
-    Rails.logger.info("CustomSSO: login action - redirecting to portal login: #{login_url}")
-    redirect_to login_url, allow_other_host: true
-  end
-
-  # ──────────────────────────────────────────────────────────
-  # 2️⃣  /custom-sso/callback
-  #
-  #    门户"进入系统"触发的 OAuth 流程最终会回调到这里。
-  #    门户后端 buildLaunchUrl() 生成的 authorize URL 中，
-  #    redirect_uri 就是指向这个地址。
-  #
-  #    认证中心授权后会带 code 和 state 参数回来：
-  #      GET /custom-sso/callback?code=xxx&state=yyy
-  #
-  #    本方法的职责：
-  #      1. 用 code 换 access_token（POST token_url）
-  #      2. 用 access_token 获取用户信息（GET user_info_url）
-  #      3. 在 Discourse 中查找或创建用户
-  #      4. 登录用户并跳转到首页
-  # ──────────────────────────────────────────────────────────
-  def callback
-    code      = params[:code]
-    state     = params[:state]
-    idp_token = params[:token].presence
-
-    Rails.logger.info(
-      "CustomSSO: callback received — code=#{code.present? ? 'present' : 'missing'}, " \
-      "state=#{state.present? ? 'present' : 'missing'}, " \
-      "token=#{idp_token.present? ? 'present' : 'missing'}, " \
-      "params=#{params.except(:controller, :action).keys.join(', ')}"
-    )
-
-    # ── 情况 A：没有任何认证参数 ────────────────────────────
-    # 门户的 launchUrl 可能只是一个裸的 /custom-sso/callback（不带参数），
-    # 此时需要重新走完整的 OAuth 流程。
-    if code.blank? && idp_token.blank? && params[:email].blank? && params[:username].blank? && params[:account].blank?
-      Rails.logger.info("CustomSSO: callback has no auth params — starting OAuth flow via /custom-sso/authorize")
-      redirect_to "/custom-sso/authorize"
-      return
-    end
-
-    # ── 情况 B：带了 token（IdP 发起 / 门户直接带 JWT 回跳）──
-    email    = nil
-    username = nil
-    name     = nil
-
-    if idp_token.present?
-      begin
-        decoded = decode_idp_token(idp_token)
-        email    = decoded[:email]    || decoded["email"]
-        username = decoded[:username] || decoded["username"] || decoded[:account] || decoded["account"] || decoded[:login] || decoded["login"]
-        name     = decoded[:name]     || decoded["name"]     || decoded[:display_name] || decoded["display_name"] || username
-        Rails.logger.info("CustomSSO: decoded idp_token — email=#{email}, username=#{username}")
-      rescue => e
-        Rails.logger.error("CustomSSO: failed to decode idp_token: #{e.class} #{e.message}")
-      end
-    end
-
-    # ── 情况 C：回调直接带了用户字段 ──────────────────────
-    email    ||= params[:email]
-    username ||= params[:username] || params[:account] || params[:login]
-    name     ||= params[:name]     || params[:display_name] || username
-
-    # ── 情况 D：带了 code，走标准 OAuth code → token → userinfo ──
-    if email.blank? || username.blank?
-      if code.blank?
-        Rails.logger.error("CustomSSO: no code and no usable token/params")
-        raise Discourse::InvalidAccess, "缺少授权码且无法获取用户信息"
-      end
-
-      token_url     = SiteSetting.custom_sso_token_url.to_s.strip
-      user_info_url = SiteSetting.custom_sso_user_info_url.to_s.strip
-
-      if token_url.blank? || user_info_url.blank?
-        Rails.logger.error("CustomSSO: token_url or user_info_url not configured")
-        raise Discourse::InvalidAccess, "OAuth 配置不完整，请同时配置 custom_sso_token_url 和 custom_sso_user_info_url"
-      end
-
-      begin
-        access_token = exchange_code_for_token(code, token_url)
-        user_info    = fetch_user_info(access_token, user_info_url)
-
-        email    = user_info["email"]    || user_info[:email]
-        username = user_info["username"] || user_info[:username] ||
-                   user_info["account"]  || user_info[:account]  ||
-                   user_info["login"]    || user_info[:login]
-        name     = user_info["name"]     || user_info[:name]     ||
-                   user_info["display_name"] || user_info[:display_name] ||
-                   username
-
-        Rails.logger.info("CustomSSO: got user info from OAuth — email=#{email}, username=#{username}, name=#{name}")
-      rescue => e
-        Rails.logger.error("CustomSSO: OAuth flow failed: #{e.class} #{e.message}")
-        Rails.logger.error(e.backtrace.first(10).join("\n"))
-        raise Discourse::InvalidAccess, "获取用户信息失败: #{e.message}"
-      end
-    end
-
-    if email.blank? || username.blank?
-      Rails.logger.error("CustomSSO: still missing email(#{email.inspect}) or username(#{username.inspect})")
-      raise Discourse::InvalidAccess, "缺少用户邮箱或用户名"
-    end
-
-    # ── 查找或创建 Discourse 用户 ─────────────────────────
-    user = find_or_provision_user(email: email, username: username, name: name)
-
-    # ── 登录并跳转 ───────────────────────────────────────
-    log_on_user(user)
-    Rails.logger.info("CustomSSO: user logged in — user_id=#{user.id}, username=#{user.username}")
-
-    redirect_to "/"
-  end
-
-  # ──────────────────────────────────────────────────────────
-  # 3️⃣  /custom-sso/authorize
-  #
-  #    主动发起 OAuth 授权请求。
-  #    当 callback 收到无参数请求时（门户 launchUrl 不带 code），
-  #    或者需要手动触发 OAuth 流程时，会跳到这里。
-  #
-  #    这里构造标准的 OAuth 2.0 Authorization Code 请求，
-  #    redirect_uri 指回 /custom-sso/callback。
-  # ──────────────────────────────────────────────────────────
-  def authorize
     authorize_url = SiteSetting.custom_sso_authorize_url.to_s.strip
     client_id     = SiteSetting.custom_sso_client_id.to_s.strip
     callback_url  = "#{discourse_base}/custom-sso/callback"
@@ -192,7 +54,7 @@ class CustomSsoController < ::ApplicationController
     end
 
     state = SecureRandom.hex(16)
-    session[:custom_sso_nonce] = state
+    session[:custom_sso_state] = state
 
     sep = authorize_url.include?("?") ? "&" : "?"
     full_url = "#{authorize_url}#{sep}" \
@@ -202,96 +64,194 @@ class CustomSsoController < ::ApplicationController
       "&redirect_uri=#{CGI.escape(callback_url)}" \
       "&state=#{state}"
 
-    Rails.logger.info("CustomSSO: authorize action — redirecting to: #{full_url}")
+    Rails.logger.info("CustomSSO: login action — redirecting to OAuth authorize: #{full_url}")
     redirect_to full_url, allow_other_host: true
   end
 
   # ──────────────────────────────────────────────────────────
-  # 4️⃣  /custom-sso/idp_initiated
+  # 2️⃣  GET /custom-sso/callback?code=xxx&state=yyy
   #
-  #    IdP 发起（门户直接带 JWT token 打开 Discourse）。
-  #    门户生成 HS256 JWT，包含 email / username / name。
+  #    认证中心授权后带 code 回调到这里。
+  #
+  #    流程：
+  #      1. 用 code 换 access_token
+  #      2. 用 access_token 获取用户信息
+  #      3. 在 Discourse 中查找用户：
+  #         - 已存在 → 直接登录，跳转首页
+  #         - 不存在 → 首次登录，创建用户（临时邮箱），
+  #                    跳转到补全信息页面
   # ──────────────────────────────────────────────────────────
-  def idp_initiated
-    unless SiteSetting.custom_sso_idp_initiated_enabled
-      raise Discourse::InvalidAccess
+  def callback
+    code  = params[:code].to_s.strip
+    state = params[:state].to_s.strip
+
+    Rails.logger.info(
+      "CustomSSO: callback received — code=#{code.present? ? 'present' : 'missing'}, " \
+      "state=#{state.present? ? 'present' : 'missing'}"
+    )
+
+    if code.blank?
+      Rails.logger.error("CustomSSO: callback missing code param")
+      raise Discourse::InvalidAccess, "缺少授权码 (code)"
     end
 
-    token = params[:token].to_s.presence
-    raise Discourse::InvalidAccess, "缺少 token" if token.blank?
+    # ── 用 code 换 token，再获取用户信息 ──────────────────
+    token_url     = SiteSetting.custom_sso_token_url.to_s.strip
+    user_info_url = SiteSetting.custom_sso_user_info_url.to_s.strip
 
-    secret = SiteSetting.custom_sso_idp_jwt_secret.to_s.presence
-    raise Discourse::InvalidAccess, "未配置 JWT 密钥" if secret.blank?
+    if token_url.blank? || user_info_url.blank?
+      Rails.logger.error("CustomSSO: token_url or user_info_url not configured")
+      raise Discourse::InvalidAccess, "OAuth 配置不完整，请配置 token_url 和 user_info_url"
+    end
 
     begin
-      decoded = decode_idp_token(token)
+      access_token = exchange_code_for_token(code, token_url)
+      user_info    = fetch_user_info(access_token, user_info_url)
+
+      username = user_info["username"] || user_info[:username] ||
+                 user_info["account"]  || user_info[:account]  ||
+                 user_info["login"]    || user_info[:login]    ||
+                 user_info["sub"]      || user_info[:sub]
+      email    = user_info["email"]    || user_info[:email]
+      name     = user_info["name"]     || user_info[:name]     ||
+                 user_info["display_name"] || user_info[:display_name] ||
+                 username
+
+      Rails.logger.info("CustomSSO: got user info — email=#{email}, username=#{username}, name=#{name}")
     rescue => e
-      Rails.logger.error("CustomSSO: idp_initiated token decode failed: #{e.class} #{e.message}")
-      raise Discourse::InvalidAccess, "token 验证失败"
+      Rails.logger.error("CustomSSO: OAuth flow failed: #{e.class} #{e.message}")
+      Rails.logger.error(e.backtrace.first(10).join("\n"))
+      raise Discourse::InvalidAccess, "获取用户信息失败: #{e.message}"
     end
 
-    email    = decoded["email"]    || decoded[:email]
-    username = decoded["username"] || decoded[:username] || decoded["account"] || decoded[:account] || decoded["login"] || decoded[:login]
-    name     = decoded["name"]     || decoded[:name]     || decoded["display_name"] || decoded[:display_name] || username
-
-    if email.blank? || username.blank?
-      Rails.logger.error("CustomSSO: idp_initiated token missing email/username: #{decoded.inspect}")
-      raise Discourse::InvalidAccess, "token 缺少 email 或 username"
+    if username.blank?
+      Rails.logger.error("CustomSSO: username is blank after OAuth flow")
+      raise Discourse::InvalidAccess, "认证中心未返回用户名"
     end
 
-    user = find_or_provision_user(email: email, username: username, name: name)
-    log_on_user(user)
+    normalized_username = normalize_username(username)
 
-    return_url = safe_return_url(params[:return_url]) || "/"
-    redirect_to return_url
+    # ── 查找已有用户 ──────────────────────────────────────
+    existing_user = User.find_by(username: normalized_username)
+    existing_user ||= User.find_by(email: email.to_s.strip.downcase) if email.present?
+
+    if existing_user
+      # ── 已有用户：直接登录 ──────────────────────────────
+      Rails.logger.info("CustomSSO: found existing user — id=#{existing_user.id}, username=#{existing_user.username}")
+
+      # 同步 name（如果有变化）
+      begin
+        existing_user.name = name.to_s if name.present? && existing_user.name.to_s != name.to_s
+        existing_user.save! if existing_user.changed?
+      rescue => e
+        Rails.logger.warn("CustomSSO: failed to sync user fields: #{e.message}")
+      end
+
+      log_on_user(existing_user)
+      redirect_to "/"
+    else
+      # ── 新用户：首次登录，需要补全邮箱和设置密码 ────────
+      Rails.logger.info("CustomSSO: new user detected — username=#{normalized_username}, redirecting to complete profile")
+
+      # 把认证信息存到 session 中，供 complete_profile 页面使用
+      session[:sso_pending_username] = normalized_username
+      session[:sso_pending_name]     = name.to_s.presence || normalized_username
+      session[:sso_pending_email]    = email.to_s.strip.downcase if email.present?
+
+      redirect_to "/custom-sso/complete-profile"
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────
+  # 3️⃣  GET /custom-sso/complete-profile
+  #
+  #    首次登录的用户需要补全邮箱和设置密码。
+  #    显示一个简单的表单页面。
+  # ──────────────────────────────────────────────────────────
+  def complete_profile
+    username = session[:sso_pending_username]
+    if username.blank?
+      redirect_to "/login"
+      return
+    end
+
+    name  = session[:sso_pending_name] || username
+    email = session[:sso_pending_email] || ""
+
+    # 渲染一个独立的 HTML 页面（不走 Ember）
+    render html: complete_profile_html(username, name, email).html_safe, layout: false
+  end
+
+  # ──────────────────────────────────────────────────────────
+  # 4️⃣  POST /custom-sso/create-account
+  #
+  #    接收补全信息表单提交，创建用户并登录。
+  # ──────────────────────────────────────────────────────────
+  def create_account
+    username = session[:sso_pending_username]
+    name     = session[:sso_pending_name]
+
+    if username.blank?
+      raise Discourse::InvalidAccess, "会话已过期，请重新登录"
+    end
+
+    email    = params[:email].to_s.strip.downcase
+    password = params[:password].to_s
+
+    # ── 验证 ──────────────────────────────────────────────
+    if email.blank? || !email.match?(/\A[^@\s]+@[^@\s]+\.[^@\s]+\z/)
+      render html: complete_profile_html(username, name, email, "请输入有效的邮箱地址").html_safe, layout: false
+      return
+    end
+
+    if password.length < 8
+      render html: complete_profile_html(username, name, email, "密码长度至少 8 位").html_safe, layout: false
+      return
+    end
+
+    if User.exists?(email: email)
+      render html: complete_profile_html(username, name, email, "该邮箱已被其他用户使用").html_safe, layout: false
+      return
+    end
+
+    # ── 创建用户 ──────────────────────────────────────────
+    final_username = ensure_unique_username(username)
+
+    begin
+      user = User.create!(
+        email:                 email,
+        username:              final_username,
+        name:                  name.present? ? name.to_s : final_username,
+        password:              password,
+        password_confirmation: password,
+        active:                true,
+        approved:              true
+      )
+
+      Rails.logger.info("CustomSSO: created new user — id=#{user.id}, email=#{email}, username=#{final_username}")
+
+      # 清除 session 中的临时数据
+      session.delete(:sso_pending_username)
+      session.delete(:sso_pending_name)
+      session.delete(:sso_pending_email)
+
+      log_on_user(user)
+      redirect_to "/"
+    rescue => e
+      Rails.logger.error("CustomSSO: failed to create user: #{e.class} #{e.message}")
+      render html: complete_profile_html(username, name, email, "创建用户失败: #{e.message}").html_safe, layout: false
+    end
   end
 
   private
 
   # ── 辅助方法 ────────────────────────────────────────────
 
-  # 优先使用 custom_sso_discourse_base_url（反向代理场景），否则用 Discourse.base_url
   def discourse_base
     custom = SiteSetting.custom_sso_discourse_base_url.to_s.strip
     custom.present? ? custom.chomp("/") : Discourse.base_url
   end
 
-  def safe_return_url(raw)
-    return "/" if raw.blank?
-    begin
-      uri = URI.parse(raw.to_s)
-    rescue URI::InvalidURIError
-      return "/"
-    end
-
-    if uri.scheme.nil? && uri.host.nil? && raw.start_with?("/") && !raw.start_with?("//")
-      raw
-    else
-      "/"
-    end
-  end
-
-  def decode_idp_token(token)
-    secret = SiteSetting.custom_sso_idp_jwt_secret.to_s.presence
-    issuer = SiteSetting.custom_sso_idp_issuer.to_s.presence
-    raise Discourse::InvalidAccess, "未配置 JWT 密钥" if secret.blank?
-
-    decode_opts = {
-      algorithm: "HS256",
-      verify_expiration: true,
-      verify_not_before: false,
-      verify_iat: false,
-    }
-    if issuer
-      decode_opts[:iss] = issuer
-      decode_opts[:verify_iss] = true
-    end
-
-    decoded, = ::JWT.decode(token, secret, true, decode_opts)
-    decoded.with_indifferent_access
-  end
-
-  # 用 code 换取 access_token（POST 请求到 token_url）
   def exchange_code_for_token(code, token_url)
     callback_url  = "#{discourse_base}/custom-sso/callback"
     client_id     = SiteSetting.custom_sso_client_id.to_s
@@ -304,10 +264,10 @@ class CustomSsoController < ::ApplicationController
 
     request = Net::HTTP::Post.new(uri.request_uri)
     request.set_form_data(
-      grant_type:   "authorization_code",
-      code:         code,
-      redirect_uri: callback_url,
-      client_id:    client_id,
+      grant_type:    "authorization_code",
+      code:          code,
+      redirect_uri:  callback_url,
+      client_id:     client_id,
       client_secret: client_secret
     )
 
@@ -335,7 +295,6 @@ class CustomSsoController < ::ApplicationController
     raise "Token 响应解析失败: #{e.message}"
   end
 
-  # 用 access_token 获取用户信息（GET 请求到 user_info_url）
   def fetch_user_info(access_token, user_info_url)
     uri  = URI.parse(user_info_url)
     http = Net::HTTP.new(uri.host, uri.port)
@@ -363,46 +322,6 @@ class CustomSsoController < ::ApplicationController
     raise "用户信息响应解析失败: #{e.message}"
   end
 
-  # 查找或创建 Discourse 用户
-  def find_or_provision_user(email:, username:, name:)
-    normalized_username = normalize_username(username)
-    normalized_email    = email.to_s.strip.downcase
-
-    # 优先按用户名匹配，其次按邮箱兜底
-    user = User.find_by(username: normalized_username) || User.find_by(email: normalized_email)
-
-    if user
-      begin
-        user.name  = name.to_s if name.present? && user.name.to_s != name.to_s
-        user.email = normalized_email if normalized_email.present? &&
-                                          user.email.to_s.downcase != normalized_email &&
-                                          !User.exists?(email: normalized_email)
-        user.save! if user.changed?
-      rescue => e
-        Rails.logger.warn("CustomSSO: failed to sync user fields: user_id=#{user.id}, err=#{e.class}: #{e.message}")
-      end
-
-      Rails.logger.info("CustomSSO: found existing user — id=#{user.id}, email=#{normalized_email}, username=#{normalized_username}")
-      return user
-    end
-
-    final_username = ensure_unique_username(normalized_username)
-    password = SecureRandom.hex(32)
-
-    user = User.create!(
-      email:                 normalized_email,
-      username:              final_username,
-      name:                  name.present? ? name.to_s : final_username,
-      password:              password,
-      password_confirmation: password,
-      active:                true,
-      approved:              true
-    )
-
-    Rails.logger.info("CustomSSO: created new user — id=#{user.id}, email=#{normalized_email}, username=#{final_username}")
-    user
-  end
-
   def normalize_username(username)
     u = username.to_s.strip
     u = u.gsub(/\s+/, "_")
@@ -423,5 +342,140 @@ class CustomSsoController < ::ApplicationController
 
     "#{base}_#{SecureRandom.hex(4)}"
   end
-end
 
+  # ── 补全信息页面 HTML ──────────────────────────────────
+  def complete_profile_html(username, name, email, error_msg = nil)
+    base_url = discourse_base
+    <<~HTML
+      <!DOCTYPE html>
+      <html lang="zh-CN">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>完善账户信息</title>
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f5f6f7;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+          }
+          .card {
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 2px 16px rgba(0,0,0,0.10);
+            padding: 40px 36px;
+            width: 100%;
+            max-width: 420px;
+          }
+          .card h2 {
+            text-align: center;
+            margin-bottom: 8px;
+            color: #222;
+            font-size: 22px;
+          }
+          .card .subtitle {
+            text-align: center;
+            color: #888;
+            font-size: 14px;
+            margin-bottom: 28px;
+          }
+          .field { margin-bottom: 20px; }
+          .field label {
+            display: block;
+            font-size: 14px;
+            color: #555;
+            margin-bottom: 6px;
+            font-weight: 500;
+          }
+          .field input {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.2s;
+          }
+          .field input:focus {
+            border-color: #0078d4;
+            box-shadow: 0 0 0 2px rgba(0,120,212,0.15);
+          }
+          .field input[readonly] {
+            background: #f3f4f6;
+            color: #888;
+            cursor: not-allowed;
+          }
+          .error-msg {
+            background: #fef2f2;
+            color: #dc2626;
+            border: 1px solid #fecaca;
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 14px;
+            margin-bottom: 20px;
+          }
+          .submit-btn {
+            width: 100%;
+            padding: 12px;
+            background: #0078d4;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+          }
+          .submit-btn:hover { background: #005a9e; }
+          .submit-btn:active { background: #004578; }
+          .tip {
+            text-align: center;
+            margin-top: 16px;
+            font-size: 13px;
+            color: #999;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>完善账户信息</h2>
+          <p class="subtitle">首次通过统一身份认证登录，请补全以下信息</p>
+
+          #{error_msg ? "<div class=\"error-msg\">#{ERB::Util.html_escape(error_msg)}</div>" : ""}
+
+          <form method="POST" action="#{base_url}/custom-sso/create-account">
+            <div class="field">
+              <label>用户名</label>
+              <input type="text" value="#{ERB::Util.html_escape(username)}" readonly />
+            </div>
+
+            <div class="field">
+              <label>显示名称</label>
+              <input type="text" value="#{ERB::Util.html_escape(name)}" readonly />
+            </div>
+
+            <div class="field">
+              <label>邮箱 <span style="color:#dc2626">*</span></label>
+              <input type="email" name="email" value="#{ERB::Util.html_escape(email)}"
+                     placeholder="请输入您的邮箱地址" required />
+            </div>
+
+            <div class="field">
+              <label>设置密码 <span style="color:#dc2626">*</span></label>
+              <input type="password" name="password" placeholder="至少 8 位" minlength="8" required />
+            </div>
+
+            <button type="submit" class="submit-btn">完成注册并登录</button>
+          </form>
+
+          <p class="tip">密码用于后续直接登录 Discourse（也可以始终使用统一身份认证登录）</p>
+        </div>
+      </body>
+      </html>
+    HTML
+  end
+end
