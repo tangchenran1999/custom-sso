@@ -6,7 +6,32 @@ export default {
   initialize() {
     withPluginApi("1.0.0", (api) => {
       // eslint-disable-next-line no-console
-      console.log("[custom-sso] initializer loaded");
+      console.log("[custom-sso] initializer loaded, path:", window.location.pathname);
+
+      // ── 关键修复：如果当前 URL 是 /custom-sso/* 后端路由，
+      //    说明 Discourse 的 Ember SPA 错误地拦截了本应由 Rails 处理的请求。
+      //    这种情况下 Ember 会尝试用 AJAX 请求该 URL，导致 403。
+      //    解决方案：检测到这种情况后，强制用完整页面导航重新请求。
+      const path = window.location.pathname;
+      if (
+        path.startsWith("/custom-sso/callback") ||
+        path.startsWith("/custom-sso/complete-profile") ||
+        path.startsWith("/custom-sso/create-account")
+      ) {
+        // eslint-disable-next-line no-console
+        console.log("[custom-sso] backend route detected, forcing full page navigation");
+        // 使用 document.location.href 赋值触发完整页面加载
+        // 加一个 _t 参数防止缓存，同时作为标记防止无限循环
+        if (!window.location.search.includes("_sso_reload=1")) {
+          const sep = window.location.search ? "&" : "?";
+          window.location.href =
+            window.location.href + sep + "_sso_reload=1";
+          return;
+        }
+        // 如果已经有 _sso_reload=1 还是到了这里，说明路由确实没注册成功
+        // 不做任何事，让 Ember 显示 404 页面
+        return;
+      }
 
       function insertSsoButton() {
         // 已经有就不重复插
