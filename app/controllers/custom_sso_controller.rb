@@ -43,11 +43,20 @@ class CustomSsoController < ::ApplicationController
     callback = "#{Discourse.base_url}/custom-sso/callback"
 
     idp_login_url = SiteSetting.custom_sso_login_url.to_s
+
+    if idp_login_url.blank?
+      Rails.logger.error("CustomSSO: custom_sso_login_url is blank! Please configure it in admin settings.")
+      render plain: "SSO 登录地址未配置，请在后台设置 custom_sso_login_url", status: 500
+      return
+    end
+
     sep = idp_login_url.include?("?") ? "&" : "?"
 
-    redirect_to "#{idp_login_url}" \
-                "#{sep}callback=#{CGI.escape(callback)}" \
-                "&nonce=#{nonce}", allow_other_host: true
+    full_redirect_url = "#{idp_login_url}#{sep}callback=#{CGI.escape(callback)}&nonce=#{nonce}"
+
+    Rails.logger.info("CustomSSO: login action - redirecting to: #{full_redirect_url}")
+
+    redirect_to full_redirect_url, allow_other_host: true
   end
 
   #
