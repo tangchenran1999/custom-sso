@@ -62,22 +62,16 @@ class CustomSsoController < ::ApplicationController
     # 生成 state 和 nonce（OpenID Connect 标准参数）
     state = SecureRandom.hex(16)
     nonce = SecureRandom.hex(16)
-    session[:custom_sso_state] = state
-    session[:custom_sso_nonce] = nonce
-
-    # 确保 session 在重定向前被保存（这对跨域重定向很重要）
-    # 通过访问 session.id 和修改 session 来触发保存
-    begin
-      _session_id = session.id
-      # 标记 session 为已修改，确保在重定向前保存
-      session[:custom_sso_timestamp] = Time.now.to_i
-    rescue => e
-      Rails.logger.warn("CustomSSO: session access warning: #{e.message}")
-    end
+    
+    # 使用 Redis 存储 state 和 nonce（避免跨域重定向导致 session 丢失）
+    # 设置 10 分钟过期时间
+    redis_key = "custom_sso_state:#{state}"
+    redis_data = { nonce: nonce, created_at: Time.now.to_i }.to_json
+    Discourse.redis.setex(redis_key, 600, redis_data) # 600 秒 = 10 分钟
 
     Rails.logger.info("CustomSSO: login — discourse_base=#{discourse_base}, callback_url=#{callback_url}")
-    Rails.logger.info("CustomSSO: session_id=#{session.id rescue 'N/A'}, state=#{state}, nonce=#{nonce}")
-    Rails.logger.info("CustomSSO: session saved state=#{session[:custom_sso_state].inspect}")
+    Rails.logger.info("CustomSSO: state=#{state}, nonce=#{nonce}")
+    Rails.logger.info("CustomSSO: saved state to Redis with key=#{redis_key}")
 
     # 使用 URI 构建器确保 URL 格式正确
     # 这样可以正确处理已有查询参数，避免重复
@@ -127,11 +121,6 @@ class CustomSsoController < ::ApplicationController
     Rails.logger.info("CustomSSO: request url=#{request.original_url}")
     Rails.logger.info("CustomSSO: discourse_base=#{discourse_base}")
     Rails.logger.info("CustomSSO: params=#{params.to_unsafe_h.except(:code).inspect}")
-    
-    # 详细记录 session 信息
-    Rails.logger.info("CustomSSO: session_id=#{session.id rescue 'N/A'}")
-    Rails.logger.info("CustomSSO: session keys=#{session.keys.inspect}")
-    Rails.logger.info("CustomSSO: session[:custom_sso_state]=#{session[:custom_sso_state].inspect}")
 
     code  = params[:code].to_s.strip
     state = params[:state].to_s.strip
@@ -150,31 +139,44 @@ class CustomSsoController < ::ApplicationController
     end
 
     # 验证 state（防止 CSRF 攻击）
-    expected_state = session[:custom_sso_state]
-    Rails.logger.info("CustomSSO: state validation — expected=#{expected_state.inspect}, received=#{state.inspect}, match=#{state == expected_state}")
-    
+    # 从 Redis 中读取 state（避免跨域重定向导致 session 丢失）
     if state.blank?
       Rails.logger.error("CustomSSO: state is blank in callback")
       render plain: "授权状态验证失败：回调中缺少 state 参数，请重新登录", status: 400
       return
     end
     
-    if expected_state.blank?
-      Rails.logger.error("CustomSSO: expected_state is blank in session — session may have been lost")
-      Rails.logger.error("CustomSSO: This usually means session was lost during cross-domain redirect")
-      render plain: "授权状态验证失败：会话已丢失，请重新登录", status: 400
+    redis_key = "custom_sso_state:#{state}"
+    redis_data = Discourse.redis.get(redis_key)
+    
+    if redis_data.blank?
+      Rails.logger.error("CustomSSO: state not found in Redis — key=#{redis_key}, state may be expired or invalid")
+      render plain: "授权状态验证失败：state 已过期或无效，请重新登录", status: 400
       return
     end
     
-    if state != expected_state
-      Rails.logger.error("CustomSSO: state mismatch — expected=#{expected_state}, got=#{state}")
-      render plain: "授权状态验证失败，请重新登录", status: 400
+    begin
+      state_info = JSON.parse(redis_data)
+      expected_nonce = state_info["nonce"]
+      Rails.logger.info("CustomSSO: state validation — found in Redis, nonce=#{expected_nonce}")
+      
+      # 验证 nonce（如果回调中提供了 nonce）
+      if nonce.present? && expected_nonce.present? && nonce != expected_nonce
+        Rails.logger.error("CustomSSO: nonce mismatch — expected=#{expected_nonce}, got=#{nonce}")
+        Discourse.redis.del(redis_key) # 删除已使用的 state
+        render plain: "授权状态验证失败：nonce 不匹配，请重新登录", status: 400
+        return
+      end
+      
+      # 验证成功，删除 Redis 中的 state（一次性使用）
+      Discourse.redis.del(redis_key)
+      Rails.logger.info("CustomSSO: state validated successfully, removed from Redis")
+    rescue JSON::ParserError => e
+      Rails.logger.error("CustomSSO: failed to parse Redis data: #{e.message}")
+      Discourse.redis.del(redis_key)
+      render plain: "授权状态验证失败：数据格式错误，请重新登录", status: 400
       return
     end
-
-    # 清除 session 中的临时数据
-    session.delete(:custom_sso_state)
-    session.delete(:custom_sso_nonce)
 
     # ── 用 code 换 token，再获取用户信息 ──────────────────
     token_url     = SiteSetting.custom_sso_token_url.to_s.strip
