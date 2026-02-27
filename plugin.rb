@@ -17,9 +17,12 @@ after_initialize do
   require_relative "app/controllers/custom_sso_controller"
 
   # ── 2. 注册路由 ──────────────────────────────────────
-  #    用 Discourse::Application.routes.draw 把路由画进主应用。
-  #    这是 Discourse 插件注册自定义路由最可靠的方式。
-  Discourse::Application.routes.draw do
+  #    ⚠️ 必须用 routes.prepend（而不是 routes.draw 或 routes.append）！
+  #    Discourse 有一个 catch-all 路由 `get "*path" => "application#index"`
+  #    会匹配所有未知路径并返回 Ember.js 的 HTML 页面。
+  #    routes.draw 会清除已有路由，routes.append 会把路由加在 catch-all 之后，
+  #    只有 routes.prepend 才能把路由加在 catch-all 之前，确保被优先匹配。
+  Discourse::Application.routes.prepend do
     get "/custom-sso/login"         => "custom_sso#login"
     get "/custom-sso/callback"      => "custom_sso#callback"
     get "/custom-sso/idp_initiated" => "custom_sso#idp_initiated"
