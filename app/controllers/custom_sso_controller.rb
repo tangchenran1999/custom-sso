@@ -59,21 +59,46 @@ class CustomSsoController < ::ApplicationController
       return
     end
 
+    # 生成 state 和 nonce（OpenID Connect 标准参数）
     state = SecureRandom.hex(16)
+    nonce = SecureRandom.hex(16)
     session[:custom_sso_state] = state
+    session[:custom_sso_nonce] = nonce
+
+    # 确保 session 在重定向前被保存（这对跨域重定向很重要）
+    # 通过访问 session.id 触发 session 的保存机制
+    _ = session.id rescue nil
 
     Rails.logger.info("CustomSSO: login — discourse_base=#{discourse_base}, callback_url=#{callback_url}")
+    Rails.logger.info("CustomSSO: session_id=#{session.id rescue 'N/A'}, state=#{state}, nonce=#{nonce}")
 
-    sep = authorize_url.include?("?") ? "&" : "?"
-    full_url = "#{authorize_url}#{sep}" \
-      "response_type=code" \
-      "&client_id=#{CGI.escape(client_id)}" \
-      "&scope=#{CGI.escape('openid profile')}" \
-      "&redirect_uri=#{CGI.escape(callback_url)}" \
-      "&state=#{state}"
+    # 使用 URI 构建器确保 URL 格式正确
+    # 这样可以正确处理已有查询参数，避免重复
+    uri = URI.parse(authorize_url)
+    query_params = {}
+    
+    # 解析已有查询参数
+    if uri.query.present?
+      URI.decode_www_form(uri.query).each do |key, value|
+        query_params[key] = value
+      end
+    end
+    
+    # 添加/覆盖 OAuth 参数
+    query_params["response_type"] = "code"
+    query_params["client_id"] = client_id
+    query_params["scope"] = "openid profile"
+    query_params["redirect_uri"] = callback_url
+    query_params["state"] = state
+    query_params["nonce"] = nonce
+    
+    uri.query = URI.encode_www_form(query_params)
+    full_url = uri.to_s
 
     Rails.logger.info("CustomSSO: login action — redirecting to OAuth authorize: #{full_url}")
-    redirect_to full_url, allow_other_host: true
+    
+    # 使用 302 重定向，确保浏览器正确处理 cookie 和 session
+    redirect_to full_url, allow_other_host: true, status: 302
   end
 
   # ──────────────────────────────────────────────────────────
@@ -98,10 +123,12 @@ class CustomSsoController < ::ApplicationController
 
     code  = params[:code].to_s.strip
     state = params[:state].to_s.strip
+    nonce = params[:nonce].to_s.strip
 
     Rails.logger.info(
       "CustomSSO: callback received — code=#{code.present? ? 'present' : 'missing'}, " \
-      "state=#{state.present? ? 'present' : 'missing'}"
+      "state=#{state.present? ? 'present' : 'missing'}, " \
+      "nonce=#{nonce.present? ? 'present' : 'missing'}"
     )
 
     if code.blank?
@@ -109,6 +136,18 @@ class CustomSsoController < ::ApplicationController
       render plain: "缺少授权码 (code)，请重新登录", status: 400
       return
     end
+
+    # 验证 state（防止 CSRF 攻击）
+    expected_state = session[:custom_sso_state]
+    if state.blank? || state != expected_state
+      Rails.logger.error("CustomSSO: state mismatch — expected=#{expected_state}, got=#{state}")
+      render plain: "授权状态验证失败，请重新登录", status: 400
+      return
+    end
+
+    # 清除 session 中的临时数据
+    session.delete(:custom_sso_state)
+    session.delete(:custom_sso_nonce)
 
     # ── 用 code 换 token，再获取用户信息 ──────────────────
     token_url     = SiteSetting.custom_sso_token_url.to_s.strip
