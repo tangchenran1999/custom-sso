@@ -271,22 +271,22 @@ class CustomSsoController < ::ApplicationController
     client_id     = SiteSetting.custom_sso_client_id.to_s
     client_secret = SiteSetting.custom_sso_client_secret.to_s
 
-    uri  = URI.parse(token_url)
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = (uri.scheme == "https")
-    http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl
+    uri = URI.parse(token_url)
+    is_ssl = (uri.scheme == "https")
 
-    request = Net::HTTP::Post.new(uri.request_uri)
-    request.set_form_data(
-      grant_type:    "authorization_code",
-      code:          code,
-      redirect_uri:  callback_url,
-      client_id:     client_id,
-      client_secret: client_secret
-    )
+    Rails.logger.info("CustomSSO: exchanging code for token at #{token_url} (ssl=#{is_ssl})")
 
-    Rails.logger.info("CustomSSO: exchanging code for token at #{token_url}")
-    response = http.request(request)
+    response = Net::HTTP.start(uri.host, uri.port, use_ssl: is_ssl, verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
+      request = Net::HTTP::Post.new(uri.request_uri)
+      request.set_form_data(
+        "grant_type"    => "authorization_code",
+        "code"          => code,
+        "redirect_uri"  => callback_url,
+        "client_id"     => client_id,
+        "client_secret" => client_secret
+      )
+      http.request(request)
+    end
 
     unless response.is_a?(Net::HTTPSuccess)
       Rails.logger.error("CustomSSO: token exchange failed — #{response.code} #{response.message}")
@@ -310,17 +310,17 @@ class CustomSsoController < ::ApplicationController
   end
 
   def fetch_user_info(access_token, user_info_url)
-    uri  = URI.parse(user_info_url)
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = (uri.scheme == "https")
-    http.verify_mode = OpenSSL::SSL::VERIFY_NONE if http.use_ssl
+    uri = URI.parse(user_info_url)
+    is_ssl = (uri.scheme == "https")
 
-    request = Net::HTTP::Get.new(uri.request_uri)
-    request["Authorization"] = "Bearer #{access_token}"
-    request["Accept"]        = "application/json"
+    Rails.logger.info("CustomSSO: fetching user info from #{user_info_url} (ssl=#{is_ssl})")
 
-    Rails.logger.info("CustomSSO: fetching user info from #{user_info_url}")
-    response = http.request(request)
+    response = Net::HTTP.start(uri.host, uri.port, use_ssl: is_ssl, verify_mode: OpenSSL::SSL::VERIFY_NONE) do |http|
+      request = Net::HTTP::Get.new(uri.request_uri)
+      request["Authorization"] = "Bearer #{access_token}"
+      request["Accept"]        = "application/json"
+      http.request(request)
+    end
 
     unless response.is_a?(Net::HTTPSuccess)
       Rails.logger.error("CustomSSO: user info fetch failed — #{response.code} #{response.message}")
