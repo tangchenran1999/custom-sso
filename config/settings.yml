@@ -17,7 +17,10 @@ plugins:
   custom_sso_idp_issuer:
     default: ""
     client: false  # 门户签发 token 的 iss 值，用来校验
-  # 以下是可选的 OAuth 配置占位，如果后面需要 code 换 token 再补充
+  custom_sso_authorize_url:
+    default: ""
+    client: false  # OAuth2 授权端点，如 https://192.168.50.192:30443/oauth2/authorize
+  # 以下是 OAuth 配置
   custom_sso_token_url:
     default: ""
     client: false
