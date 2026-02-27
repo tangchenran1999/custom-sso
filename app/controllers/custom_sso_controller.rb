@@ -43,9 +43,23 @@ class CustomSsoController < ::ApplicationController
   #    全程不经过门户 portal 页面。
   # ──────────────────────────────────────────────────────────
   def login
+    Rails.logger.info("CustomSSO: ========== login action entered ==========")
+    Rails.logger.info("CustomSSO: request method=#{request.method}, format=#{request.format}")
+    Rails.logger.info("CustomSSO: request url=#{request.original_url}")
+    Rails.logger.info("CustomSSO: current_user=#{current_user&.username || 'anonymous'}")
+    
+    # 如果用户已经登录，先登出，然后再进行 SSO 登录
+    if current_user
+      Rails.logger.info("CustomSSO: user already logged in (#{current_user.username}), logging out first")
+      log_off_user
+      Rails.logger.info("CustomSSO: user logged out, proceeding with SSO login")
+    end
+    
     authorize_url = SiteSetting.custom_sso_authorize_url.to_s.strip
     client_id     = SiteSetting.custom_sso_client_id.to_s.strip
     callback_url  = "#{discourse_base}/custom-sso/callback"
+
+    Rails.logger.info("CustomSSO: authorize_url=#{authorize_url}, client_id=#{client_id.present? ? 'present' : 'blank'}")
 
     if authorize_url.blank?
       Rails.logger.error("CustomSSO: custom_sso_authorize_url is blank!")
