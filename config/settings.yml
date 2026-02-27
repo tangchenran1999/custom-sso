@@ -1,0 +1,32 @@
+plugins:
+  custom_sso_enabled:
+    default: true
+    client: true
+  custom_sso_login_url:
+    default: "https://192.168.50.192:30443/login"
+    client: true   # 前端按钮跳转的统一认证登录页
+  custom_sso_discourse_base_url:
+    default: ""
+    client: true   # 反向代理不转 /custom_sso 时，用真实 Discourse 主机
+  custom_sso_idp_initiated_enabled:
+    default: false
+    client: true   # 允许 IdP 发起（门户直接带 token 打开 Discourse）
+  custom_sso_idp_jwt_secret:
+    default: ""
+    client: false  # 门户签发 token 的对称密钥（HS256）
+  custom_sso_idp_issuer:
+    default: ""
+    client: false  # 门户签发 token 的 iss 值，用来校验
+  # 以下是可选的 OAuth 配置占位，如果后面需要 code 换 token 再补充
+  custom_sso_token_url:
+    default: ""
+    client: false
+  custom_sso_user_info_url:
+    default: ""
+    client: false
+  custom_sso_client_id:
+    default: ""
+    client: false
+  custom_sso_client_secret:
+    default: ""
+    client: false

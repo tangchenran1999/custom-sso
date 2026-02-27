@@ -1,0 +1,9 @@
+en:
+  admin_js:
+    admin:
+      site_settings:
+        categories:
+          custom_sso: "Custom SSO"
+  js:
+    custom_sso:
+      login_button: "Unified Identity Login"
