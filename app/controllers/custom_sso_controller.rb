@@ -19,8 +19,8 @@ class CustomSsoController < ::ApplicationController
   #    第三方 SSO 配置的登录入口就是这个地址：/custom-sso/login
   #
   def login
-    nonce = SecureRandom.hex(16)
-    session[:custom_sso_nonce] = nonce
+    state = SecureRandom.hex(16)
+    session[:custom_sso_nonce] = state
 
     # 只允许站内相对路径，防止开放重定向（例如 https://evil.com）
     return_url = params[:return_url].to_s
@@ -40,21 +40,33 @@ class CustomSsoController < ::ApplicationController
       session[:custom_sso_return_url] = "/"
     end
 
-    callback = "#{Discourse.base_url}/custom-sso/callback"
+    # ── 构造 OAuth 2.0 授权请求 ──────────────────────────
+    authorize_url = SiteSetting.custom_sso_authorize_url.to_s
+    client_id     = SiteSetting.custom_sso_client_id.to_s
+    callback_url  = "#{discourse_base}/custom-sso/callback"
 
-    idp_login_url = SiteSetting.custom_sso_login_url.to_s
-
-    if idp_login_url.blank?
-      Rails.logger.error("CustomSSO: custom_sso_login_url is blank! Please configure it in admin settings.")
-      render plain: "SSO 登录地址未配置，请在后台设置 custom_sso_login_url", status: 500
+    if authorize_url.blank?
+      Rails.logger.error("CustomSSO: custom_sso_authorize_url is blank! Please configure it in admin settings.")
+      render plain: "OAuth 授权端点未配置，请在后台设置 custom_sso_authorize_url", status: 500
       return
     end
 
-    sep = idp_login_url.include?("?") ? "&" : "?"
+    if client_id.blank?
+      Rails.logger.error("CustomSSO: custom_sso_client_id is blank!")
+      render plain: "OAuth client_id 未配置，请在后台设置 custom_sso_client_id", status: 500
+      return
+    end
 
-    full_redirect_url = "#{idp_login_url}#{sep}callback=#{CGI.escape(callback)}&nonce=#{nonce}"
+    # 标准 OAuth 2.0 Authorization Code 请求
+    sep = authorize_url.include?("?") ? "&" : "?"
+    full_redirect_url = "#{authorize_url}#{sep}" \
+      "response_type=code" \
+      "&client_id=#{CGI.escape(client_id)}" \
+      "&scope=#{CGI.escape('openid profile')}" \
+      "&redirect_uri=#{CGI.escape(callback_url)}" \
+      "&state=#{state}"
 
-    Rails.logger.info("CustomSSO: login action - redirecting to: #{full_redirect_url}")
+    Rails.logger.info("CustomSSO: login action - redirecting to OAuth authorize: #{full_redirect_url}")
 
     redirect_to full_redirect_url, allow_other_host: true
   end
@@ -71,6 +83,16 @@ class CustomSsoController < ::ApplicationController
     Rails.logger.info(
       "CustomSSO: Callback received - code=#{code.present? ? 'present' : 'missing'}, token=#{idp_token.present?}, state=#{state}, all_params=#{params.except(:controller, :action).inspect}"
     )
+
+    # ── 门户"进入系统"兜底 ──────────────────────────────
+    # 门户的 /launch 接口只返回 launchUrl（不带任何参数），
+    # 浏览器直接 GET /custom-sso/callback 时没有 code / token / email。
+    # 此时自动重定向到 /custom-sso/login，走完整的 SSO 流程。
+    if code.blank? && idp_token.blank? && params[:email].blank? && params[:username].blank? && params[:account].blank?
+      Rails.logger.info("CustomSSO: Callback received without any auth params — redirecting to /custom-sso/login")
+      redirect_to "/custom-sso/login"
+      return
+    end
 
     stored_nonce = session[:custom_sso_nonce]
     if stored_nonce.present?
@@ -211,6 +233,12 @@ class CustomSsoController < ::ApplicationController
 
   private
 
+  # 优先使用 custom_sso_discourse_base_url（反向代理场景），否则用 Discourse.base_url
+  def discourse_base
+    custom = SiteSetting.custom_sso_discourse_base_url.to_s.strip
+    custom.present? ? custom.chomp("/") : Discourse.base_url
+  end
+
   def safe_return_url(raw)
     return "/" if raw.blank?
     begin
@@ -248,7 +276,7 @@ class CustomSsoController < ::ApplicationController
 
   # 用 code 换取 access_token
   def exchange_code_for_token(code, token_url)
-    callback_url = "#{Discourse.base_url}/custom-sso/callback"
+    callback_url = "#{discourse_base}/custom-sso/callback"
     client_id = SiteSetting.custom_sso_client_id.to_s
     client_secret = SiteSetting.custom_sso_client_secret.to_s
 
