@@ -338,66 +338,79 @@ class CustomSsoController < ::ApplicationController
   # ──────────────────────────────────────────────────────────
   def create_account
     profile_token = params[:token].to_s.strip
+    username = nil
+    name = nil
+    email = nil
     
-    if profile_token.blank?
-      render plain: "缺少验证令牌，请重新登录", status: 400
-      return
-    end
-
-    # 从 Redis 中读取用户信息
-    redis_key = "custom_sso_profile:#{profile_token}"
-    redis_data = Discourse.redis.get(redis_key)
-    
-    if redis_data.blank?
-      render plain: "验证令牌已过期或无效，请重新登录", status: 400
-      return
-    end
-
     begin
-      profile_data = JSON.parse(redis_data)
-      username = profile_data["username"]
-      name     = profile_data["name"] || username
-    rescue JSON::ParserError => e
-      Rails.logger.error("CustomSSO: failed to parse profile data: #{e.message}")
-      render plain: "数据解析失败，请重新登录", status: 400
-      return
-    end
+      if profile_token.blank?
+        render plain: "缺少验证令牌，请重新登录", status: 400
+        return
+      end
 
-    # 从表单获取用户输入（用户名来自认证平台，不可修改）
-    email    = params[:email].to_s.strip.downcase
-    password = params[:password].to_s
+      # 从 Redis 中读取用户信息
+      redis_key = "custom_sso_profile:#{profile_token}"
+      redis_data = Discourse.redis.get(redis_key)
+      
+      if redis_data.blank?
+        render plain: "验证令牌已过期或无效，请重新登录", status: 400
+        return
+      end
 
-    # 用户名从 Redis 中获取（来自认证平台），不允许修改
-    final_username = username
+      begin
+        profile_data = JSON.parse(redis_data)
+        username = profile_data["username"]
+        name     = profile_data["name"] || username
+      rescue JSON::ParserError => e
+        Rails.logger.error("CustomSSO: failed to parse profile data: #{e.message}")
+        render plain: "数据解析失败，请重新登录", status: 400
+        return
+      end
 
-    # ── 验证邮箱 ──────────────────────────────────────────
-    if email.blank? || !email.match?(/\A[^@\s]+@[^@\s]+\.[^@\s]+\z/)
-      render html: complete_profile_html(username, name, email, "请输入有效的邮箱地址", profile_token).html_safe, layout: false
-      return
-    end
+      # 从表单获取用户输入（用户名来自认证平台，不可修改）
+      email    = params[:email].to_s.strip.downcase
+      password = params[:password].to_s
 
-    # ── 验证密码 ──────────────────────────────────────────
-    if password.length < 8
-      render html: complete_profile_html(username, name, email, "密码长度至少 8 位", profile_token).html_safe, layout: false
-      return
-    end
+      # 用户名从 Redis 中获取（来自认证平台），不允许修改
+      final_username = username
 
-    # ── 检查用户名和邮箱是否已存在 ────────────────────────
-    if User.exists?(username: final_username)
-      render html: complete_profile_html(username, name, email, "该用户名已被使用，请联系管理员", profile_token).html_safe, layout: false
-      return
-    end
+      # ── 验证邮箱 ──────────────────────────────────────────
+      if email.blank? || !email.match?(/\A[^@\s]+@[^@\s]+\.[^@\s]+\z/)
+        render html: complete_profile_html(username, name, email, "请输入有效的邮箱地址", profile_token).html_safe, layout: false
+        return
+      end
 
-    if User.exists?(email: email)
-      render html: complete_profile_html(username, name, email, "该邮箱已被其他用户使用", profile_token).html_safe, layout: false
-      return
-    end
+      # ── 验证密码 ──────────────────────────────────────────
+      if password.length < 8
+        render html: complete_profile_html(username, name, email, "密码长度至少 8 位", profile_token).html_safe, layout: false
+        return
+      end
 
-    # ── 创建用户 ──────────────────────────────────────────
-    begin
+      # ── 检查用户名和邮箱是否已存在 ────────────────────────
+      if User.exists?(username: final_username)
+        render html: complete_profile_html(username, name, email, "该用户名已被使用，请联系管理员", profile_token).html_safe, layout: false
+        return
+      end
+
+      if User.exists?(email: email)
+        render html: complete_profile_html(username, name, email, "该邮箱已被其他用户使用", profile_token).html_safe, layout: false
+        return
+      end
+
+      # ── 创建用户 ──────────────────────────────────────────
+      Rails.logger.info("CustomSSO: attempting to create user — email=#{email}, username=#{final_username}, name=#{name}")
+      
       # 使用 Discourse 的 UserCreator 服务创建用户
       # 第一个参数是当前用户（nil 表示系统创建），第二个参数是用户属性
-      creator = UserCreator.new(nil, {
+      # 注意：需要提供 ip_address，否则可能报错
+      ip_address = begin
+        request.remote_ip
+      rescue => e
+        Rails.logger.warn("CustomSSO: failed to get remote_ip: #{e.message}")
+        "127.0.0.1"
+      end
+      
+      user_params = {
         email: email,
         username: final_username,
         name: name,
@@ -406,15 +419,29 @@ class CustomSsoController < ::ApplicationController
         active: true,
         approved: true,
         skip_email_validation: false,
-        created_at: Time.zone.now
-      })
+        ip_address: ip_address
+      }
       
+      Rails.logger.info("CustomSSO: UserCreator params: #{user_params.except(:password).inspect}")
+      
+      # 确保使用正确的 UserCreator 类
+      creator_class = defined?(::UserCreator) ? ::UserCreator : UserCreator
+      Rails.logger.info("CustomSSO: Using UserCreator class: #{creator_class}")
+      
+      creator = creator_class.new(nil, user_params)
+      
+      Rails.logger.info("CustomSSO: UserCreator initialized, calling create...")
       result = creator.create
+      
+      Rails.logger.info("CustomSSO: UserCreator.create returned — success=#{result.success?}, user=#{result.user&.id}")
       
       unless result.success?
         error_message = result.errors.full_messages.join(", ")
         Rails.logger.error("CustomSSO: UserCreator failed — #{error_message}")
         Rails.logger.error("CustomSSO: UserCreator result: #{result.inspect}")
+        if result.errors.respond_to?(:full_messages)
+          Rails.logger.error("CustomSSO: UserCreator errors: #{result.errors.full_messages.inspect}")
+        end
         render html: complete_profile_html(username, name, email, "创建用户失败: #{error_message}", profile_token).html_safe, layout: false
         return
       end
@@ -423,6 +450,7 @@ class CustomSsoController < ::ApplicationController
       
       unless user
         Rails.logger.error("CustomSSO: UserCreator returned success but user is nil")
+        Rails.logger.error("CustomSSO: UserCreator result object: #{result.inspect}")
         render html: complete_profile_html(username, name, email, "创建用户失败: 用户对象为空", profile_token).html_safe, layout: false
         return
       end
@@ -434,14 +462,22 @@ class CustomSsoController < ::ApplicationController
       Rails.logger.info("CustomSSO: deleted profile data from Redis — key=#{redis_key}")
 
       # 自动登录用户
+      Rails.logger.info("CustomSSO: attempting to log in user...")
       log_on_user(user)
       Rails.logger.info("CustomSSO: user logged in automatically after account creation — username=#{final_username}")
       
+      Rails.logger.info("CustomSSO: redirecting to #{discourse_base}/")
       redirect_to "#{discourse_base}/", allow_other_host: true
     rescue => e
-      Rails.logger.error("CustomSSO: failed to create user: #{e.class} #{e.message}")
-      Rails.logger.error(e.backtrace.first(10).join("\n"))
-      render html: complete_profile_html(username, name, email, "创建用户失败: #{e.message}", profile_token).html_safe, layout: false
+      Rails.logger.error("CustomSSO: exception in create_account — #{e.class}: #{e.message}")
+      Rails.logger.error("CustomSSO: backtrace: #{e.backtrace.first(20).join("\n")}")
+      error_msg = "创建用户失败: #{e.class} - #{e.message}"
+      begin
+        render html: complete_profile_html(username || "unknown", name || "unknown", email || "", error_msg, profile_token).html_safe, layout: false
+      rescue => render_error
+        Rails.logger.error("CustomSSO: failed to render error page: #{render_error.message}")
+        render plain: error_msg, status: 500
+      end
     end
   end
 
