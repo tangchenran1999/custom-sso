@@ -84,9 +84,24 @@ class CustomSsoController < ::ApplicationController
     Rails.logger.info("CustomSSO:   custom_sso_client_id=#{SiteSetting.custom_sso_client_id.present? ? 'configured' : 'NOT CONFIGURED'}")
     Rails.logger.info("CustomSSO:   custom_sso_discourse_base_url=#{SiteSetting.custom_sso_discourse_base_url.present? ? SiteSetting.custom_sso_discourse_base_url : 'using default'}")
     
-    # 如果用户已经登录，先登出，然后再进行 SSO 登录
+    # 如果用户已经登录：
+    # - 默认不强制登出（否则一旦 Discourse 把 return-to 设成 /custom-sso/login，会造成“原生登录成功又被踢出”的体验）
+    # - 只有显式带参数才允许切换账号走 SSO
     if current_user
-      Rails.logger.info("CustomSSO: user already logged in (#{current_user.username}), logging out first")
+      force = ActiveModel::Type::Boolean.new.cast(params[:force]) ||
+        ActiveModel::Type::Boolean.new.cast(params[:switch_account]) ||
+        ActiveModel::Type::Boolean.new.cast(params[:logout])
+
+      unless force
+        Rails.logger.warn(
+          "CustomSSO: /custom-sso/login visited while already logged in as #{current_user.username}; " \
+          "redirecting to home (no forced logout). Pass ?force=1 to switch account via SSO."
+        )
+        redirect_to "#{discourse_base}/", allow_other_host: true, status: 302
+        return
+      end
+
+      Rails.logger.info("CustomSSO: force switch_account requested; logging out #{current_user.username} first")
       log_off_user
       Rails.logger.info("CustomSSO: user logged out, proceeding with SSO login")
     end
