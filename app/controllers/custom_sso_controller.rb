@@ -249,7 +249,7 @@ class CustomSsoController < ::ApplicationController
 
     # ── 查找已有用户 ──────────────────────────────────────
     existing_user = User.find_by(username: normalized_username)
-    existing_user ||= User.find_by(email: email.to_s.strip.downcase) if email.present?
+    existing_user ||= User.find_by_email(email.to_s.strip.downcase) if email.present?
 
     if existing_user
       # ── 已有用户：直接登录 ──────────────────────────────
@@ -392,7 +392,8 @@ class CustomSsoController < ::ApplicationController
         return
       end
 
-      if User.exists?(email: email)
+      # Discourse 中邮箱存储在 user_emails 表中，需要使用正确的方法检查
+      if UserEmail.exists?(email: email.to_s.strip.downcase)
         render html: complete_profile_html(username, name, email, "该邮箱已被其他用户使用", profile_token).html_safe, layout: false
         return
       end
