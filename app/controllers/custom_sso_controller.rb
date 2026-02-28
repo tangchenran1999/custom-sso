@@ -399,9 +399,13 @@ class CustomSsoController < ::ApplicationController
 
       # ── 检查用户名冲突（参考官方源码） ────────────────────
       # 检查是否与现有路由冲突
-      if Discourse::Application.routes.recognize_path("/#{final_username}") rescue nil
+      begin
+        Discourse::Application.routes.recognize_path("/#{final_username}")
+        # 如果能识别路由，说明有冲突
         render html: complete_profile_html(username, name, email, "该用户名与现有路由冲突", profile_token).html_safe, layout: false
         return
+      rescue
+        # 如果抛出异常，说明没有路由冲突，继续
       end
       
       if User.reserved_username?(final_username)
