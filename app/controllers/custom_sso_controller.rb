@@ -47,14 +47,42 @@ class CustomSsoController < ::ApplicationController
     Rails.logger.info("CustomSSO: request method=#{request.method}, format=#{request.format}")
     Rails.logger.info("CustomSSO: request url=#{request.original_url}")
     Rails.logger.info("CustomSSO: current_user=#{current_user&.username || 'anonymous'}")
+    Rails.logger.info("CustomSSO: referer=#{request.referer}")
+    Rails.logger.info("CustomSSO: params=#{params.inspect}")
+    
+    # ── 检查插件是否启用 ──────────────────────────────────
+    unless SiteSetting.custom_sso_enabled
+      Rails.logger.error("CustomSSO: Plugin is disabled! Check custom_sso_enabled setting.")
+      render plain: "Custom SSO 插件未启用，请在后台设置中启用 custom_sso_enabled", status: 403
+      return
+    end
     
     # ── 关键保护：只接受 GET 请求，拒绝 POST 请求 ────────
     # 原生登录表单提交是 POST 请求，不应该到达这里
+    # 如果收到 POST 请求，可能是：
+    # 1. Discourse 原生登录表单被错误地提交到这里
+    # 2. 后台配置了某些参数导致登录表单 action 被修改
+    # 3. 其他插件或中间件拦截了请求
     if request.method != "GET"
-      Rails.logger.error("CustomSSO: login action received non-GET request (#{request.method}), redirecting to /login")
-      redirect_to "/login", status: 302
+      Rails.logger.error("CustomSSO: login action received non-GET request (#{request.method})")
+      Rails.logger.error("CustomSSO: This should not happen!")
+      Rails.logger.error("CustomSSO: Possible causes:")
+      Rails.logger.error("CustomSSO:   1. Login form action was modified by another plugin")
+      Rails.logger.error("CustomSSO:   2. Discourse SSO settings conflict with custom SSO")
+      Rails.logger.error("CustomSSO:   3. Middleware or route matching issue")
+      Rails.logger.error("CustomSSO: Check Discourse admin settings for SSO-related configurations")
+      # 如果是 POST 请求，直接返回 405 Method Not Allowed，而不是重定向
+      # 这样可以避免重定向循环
+      head :method_not_allowed
       return
     end
+    
+    # ── 输出配置状态（用于诊断）────────────────────────────
+    Rails.logger.info("CustomSSO: Configuration check:")
+    Rails.logger.info("CustomSSO:   custom_sso_enabled=#{SiteSetting.custom_sso_enabled}")
+    Rails.logger.info("CustomSSO:   custom_sso_authorize_url=#{SiteSetting.custom_sso_authorize_url.present? ? 'configured' : 'NOT CONFIGURED'}")
+    Rails.logger.info("CustomSSO:   custom_sso_client_id=#{SiteSetting.custom_sso_client_id.present? ? 'configured' : 'NOT CONFIGURED'}")
+    Rails.logger.info("CustomSSO:   custom_sso_discourse_base_url=#{SiteSetting.custom_sso_discourse_base_url.present? ? SiteSetting.custom_sso_discourse_base_url : 'using default'}")
     
     # 如果用户已经登录，先登出，然后再进行 SSO 登录
     if current_user
