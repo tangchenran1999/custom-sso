@@ -49,9 +49,26 @@ export default {
           return;
         }
 
+        // ── 关键保护：确保不会修改或影响原生登录表单 ────────
+        // 查找所有登录表单，确保它们的action属性不被修改
+        const loginForms = document.querySelectorAll('form[action*="/login"], form[action*="/session"]');
+        loginForms.forEach((form) => {
+          // 确保表单的action属性不被修改
+          const originalAction = form.getAttribute("action");
+          if (originalAction && !originalAction.includes("/custom-sso/")) {
+            // 如果表单的action被错误地修改了，恢复它
+            if (form.getAttribute("data-original-action")) {
+              form.setAttribute("action", form.getAttribute("data-original-action"));
+            } else {
+              // 保存原始action，以防万一
+              form.setAttribute("data-original-action", originalAction);
+            }
+          }
+        });
+
         const btn = document.createElement("button");
         btn.className = "btn btn-primary custom-sso-btn";
-        btn.type = "button";
+        btn.type = "button"; // 关键：type="button" 确保不会触发表单提交
         btn.textContent = "统一身份认证";
         // 添加明确的标识，避免与原生登录按钮混淆
         btn.setAttribute("data-custom-sso", "true");
@@ -76,6 +93,38 @@ export default {
 
         // 放到最前面
         container.prepend(btn);
+
+        // ── 额外保护：监听表单提交，确保原生登录表单不会被错误提交到 /custom-sso/login ────────
+        loginForms.forEach((form) => {
+          form.addEventListener("submit", (e) => {
+            const formAction = form.getAttribute("action") || form.action;
+            // eslint-disable-next-line no-console
+            console.log("[custom-sso] 检测到表单提交，action:", formAction);
+            
+            // 如果表单的action被错误地设置为 /custom-sso/login，阻止提交并恢复
+            if (formAction && formAction.includes("/custom-sso/login")) {
+              // eslint-disable-next-line no-console
+              console.error("[custom-sso] 错误：原生登录表单的action被设置为 /custom-sso/login，已阻止并恢复");
+              e.preventDefault();
+              e.stopPropagation();
+              
+              // 恢复原始action
+              const originalAction = form.getAttribute("data-original-action");
+              if (originalAction) {
+                form.setAttribute("action", originalAction);
+                // eslint-disable-next-line no-console
+                console.log("[custom-sso] 已恢复表单action为:", originalAction);
+              } else {
+                // 如果没有保存原始action，使用默认的Discourse登录路径
+                form.setAttribute("action", "/session");
+                // eslint-disable-next-line no-console
+                console.log("[custom-sso] 已设置表单action为默认值: /session");
+              }
+              
+              return false;
+            }
+          }, true); // 使用捕获阶段，确保优先处理
+        });
 
         // eslint-disable-next-line no-console
         console.log("[custom-sso] button inserted - 注意：此按钮仅用于统一身份认证，不影响原生登录/注册功能");
