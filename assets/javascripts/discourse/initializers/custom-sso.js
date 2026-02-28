@@ -1,61 +1,62 @@
 import { withPluginApi } from "discourse/lib/plugin-api";
+import DiscourseURL from "discourse/lib/url";
 
 // ══════════════════════════════════════════════════════════════════
-// 🔒 最早期拦截：在 Discourse Ember 路由器之前拦截 history API
-//    防止登录成功后 Ember 通过 pushState 导航到 /custom-sso/login
-//    这段代码必须在模块加载时立即执行（不能等 withPluginApi 回调）
+// 🔒 最早期拦截（多层防护）
+//    防止原生登录成功后跳转到 /custom-sso/login
+//
+//    Discourse 原生登录流程：
+//    1. 前端 AJAX POST /session → 后端返回 JSON { destination_url: "/custom-sso/login" }
+//    2. 前端调用 DiscourseURL.routeTo(destination_url) 或 window.location = destination_url
+//    3. Ember 路由器找不到 /custom-sso/login → 显示 404
+//
+//    我们需要在多个层面拦截：
+//    A) history.pushState / replaceState（Ember 内部路由）
+//    B) DiscourseURL.routeTo / redirectTo（Discourse 的跳转 API）
+//    C) window.location 赋值（全页面跳转的最后防线）
 // ══════════════════════════════════════════════════════════════════
+
+// 判断 URL 是否指向 /custom-sso/login
+function _isBadSsoUrl(url) {
+  if (typeof url !== "string") {
+    return false;
+  }
+  try {
+    const parsed = new URL(url, window.location.origin);
+    return parsed.pathname === "/custom-sso/login";
+  } catch (_) {
+    return (
+      url === "/custom-sso/login" ||
+      url.startsWith("/custom-sso/login?") ||
+      url.startsWith("/custom-sso/login#")
+    );
+  }
+}
+
+// ── A) 拦截 history.pushState / replaceState ──────────────────
 (function earlyIntercept() {
-  // 检查 URL 是否指向 /custom-sso/login（不含 callback 等其他路由）
-  function isBadSsoRedirect(url) {
-    if (typeof url !== "string") {
-      return false;
-    }
-    try {
-      // 处理相对路径和绝对路径
-      const parsed = new URL(url, window.location.origin);
-      return parsed.pathname === "/custom-sso/login" || parsed.pathname.startsWith("/custom-sso/login?");
-    } catch (_) {
-      return url === "/custom-sso/login" || url.startsWith("/custom-sso/login?") || url.startsWith("/custom-sso/login#");
-    }
-  }
-
-  function fixUrl(url) {
-    if (typeof url !== "string") {
-      return url;
-    }
-    try {
-      const parsed = new URL(url, window.location.origin);
-      parsed.pathname = "/";
-      return parsed.pathname + parsed.search + parsed.hash;
-    } catch (_) {
-      return "/";
-    }
-  }
-
   const _origPushState = history.pushState;
   const _origReplaceState = history.replaceState;
 
   history.pushState = function (state, title, url) {
-    if (isBadSsoRedirect(url)) {
+    if (_isBadSsoUrl(url)) {
       // eslint-disable-next-line no-console
       console.warn("[custom-sso][early] intercepted pushState to /custom-sso/login → rewriting to /");
-      url = fixUrl(url);
+      url = "/";
     }
     return _origPushState.call(this, state, title, url);
   };
 
   history.replaceState = function (state, title, url) {
-    if (isBadSsoRedirect(url)) {
+    if (_isBadSsoUrl(url)) {
       // eslint-disable-next-line no-console
       console.warn("[custom-sso][early] intercepted replaceState to /custom-sso/login → rewriting to /");
-      url = fixUrl(url);
+      url = "/";
     }
     return _origReplaceState.call(this, state, title, url);
   };
 
-  // 如果页面已经在 /custom-sso/login 上（例如硬刷新或直接访问）
-  // 且 Discourse 的 session cookie 存在（说明用户已登录），直接跳首页
+  // 如果页面已经在 /custom-sso/login 上且用户已登录，直接跳首页
   if (window.location.pathname === "/custom-sso/login" && document.cookie.includes("_t=")) {
     // eslint-disable-next-line no-console
     console.warn("[custom-sso][early] already on /custom-sso/login and logged in → redirecting to /");
@@ -71,61 +72,46 @@ export default {
       // eslint-disable-next-line no-console
       console.log("[custom-sso] initializer loaded");
 
-      // ── 防止原生登录成功后回跳到 /custom-sso/login ─────────
-      // 有些情况下（例如之前访问过 /custom-sso/login），Discourse 会把它保存成登录后的 redirect/return_path。
-      // 用户选择"原生登录"时，这会导致登录成功后又被带回 /custom-sso/login。
-      // 这里在 /login 页面把这种 redirect 参数改写成 "/"，避免回跳。
-      function sanitizeLoginRedirectParams() {
-        try {
-          const u = new URL(window.location.href);
-          const keys = ["redirect", "return_path", "destination_url", "return_to"];
-          let changed = false;
-
-          keys.forEach((k) => {
-            const v = u.searchParams.get(k);
-            if (v && (v.includes("/custom-sso/login") || v === "/custom-sso/login")) {
-              u.searchParams.set(k, "/");
-              changed = true;
-              // eslint-disable-next-line no-console
-              console.warn(`[custom-sso] sanitized ${k} parameter from ${v} to /`);
-            }
-          });
-
-          if (changed) {
-            const next =
-              u.pathname +
-              (u.searchParams.toString() ? `?${u.searchParams.toString()}` : "") +
-              u.hash;
-            window.history.replaceState({}, document.title, next);
-            // eslint-disable-next-line no-console
-            console.warn("[custom-sso] detected bad login redirect to /custom-sso/login; rewrote to /");
+      // ── B) 拦截 DiscourseURL.routeTo / redirectTo ──────────
+      //    Discourse 原生登录成功后，前端通过 DiscourseURL.routeTo(destination_url)
+      //    跳转到 session["destination_url"]。如果这个值是 /custom-sso/login，
+      //    Ember 路由器找不到对应路由就会显示 404。
+      //    这里拦截 DiscourseURL 的方法，把 /custom-sso/login 改写为 /。
+      try {
+        if (DiscourseURL) {
+          const _origRouteTo = DiscourseURL.routeTo;
+          if (_origRouteTo) {
+            DiscourseURL.routeTo = function (url, opts) {
+              if (_isBadSsoUrl(url)) {
+                // eslint-disable-next-line no-console
+                console.warn("[custom-sso] intercepted DiscourseURL.routeTo(/custom-sso/login) → rewriting to /");
+                return _origRouteTo.call(this, "/", opts);
+              }
+              return _origRouteTo.call(this, url, opts);
+            };
           }
-        } catch (e) {
+
+          const _origRedirectTo = DiscourseURL.redirectTo;
+          if (_origRedirectTo) {
+            DiscourseURL.redirectTo = function (url) {
+              if (_isBadSsoUrl(url)) {
+                // eslint-disable-next-line no-console
+                console.warn("[custom-sso] intercepted DiscourseURL.redirectTo(/custom-sso/login) → rewriting to /");
+                return _origRedirectTo.call(this, "/");
+              }
+              return _origRedirectTo.call(this, url);
+            };
+          }
+
           // eslint-disable-next-line no-console
-          console.warn("[custom-sso] failed to sanitize login redirect params", e);
+          console.log("[custom-sso] DiscourseURL.routeTo/redirectTo interceptors installed");
         }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn("[custom-sso] failed to intercept DiscourseURL methods:", e);
       }
 
-      // 在 /login 页面立即执行
-      if (window.location.pathname === "/login") {
-        sanitizeLoginRedirectParams();
-      }
-
-      // 监听 URL 变化（SPA 路由切换）
-      let lastUrl = window.location.href;
-      setInterval(() => {
-        if (window.location.href !== lastUrl) {
-          lastUrl = window.location.href;
-          if (window.location.pathname === "/login") {
-            sanitizeLoginRedirectParams();
-          }
-        }
-      }, 100);
-
-      // ── 关键修复：如果当前 URL 是 /custom-sso/* 后端路由，
-      //    需要区分两种情况：
-      //    A) 用户已登录 → 直接跳首页（不要再走 SSO 流程）
-      //    B) 用户未登录 → 强制全页面刷新让 Rails 处理
+      // ── C) 如果当前 URL 是 /custom-sso/* 后端路由 ──────────
       const path = window.location.pathname;
       if (
         path.startsWith("/custom-sso/callback") ||
@@ -143,10 +129,10 @@ export default {
         return;
       }
 
-      if (path === "/custom-sso/login" || path.startsWith("/custom-sso/login?")) {
+      if (path === "/custom-sso/login") {
         // /custom-sso/login 需要特殊处理
         if (document.cookie.includes("_t=")) {
-          // 用户已登录，直接跳首页（不要走 SSO 流程）
+          // 用户已登录，直接跳首页
           // eslint-disable-next-line no-console
           console.warn("[custom-sso] on /custom-sso/login but already logged in → redirecting to /");
           window.location.replace("/");
@@ -163,6 +149,15 @@ export default {
         return;
       }
 
+      // ── D) 监听页面变化，如果 Ember 路由到了 /custom-sso/login 就重定向 ──
+      api.onPageChange((url) => {
+        if (url && (url === "/custom-sso/login" || url.startsWith("/custom-sso/login?"))) {
+          // eslint-disable-next-line no-console
+          console.warn("[custom-sso] onPageChange detected /custom-sso/login → redirecting to /");
+          DiscourseURL.routeTo("/");
+        }
+      });
+
       // ── popstate 监听（浏览器前进/后退按钮）────────
       window.addEventListener("popstate", () => {
         if (window.location.pathname === "/custom-sso/login") {
@@ -170,80 +165,6 @@ export default {
           console.warn("[custom-sso] detected navigation to /custom-sso/login via popstate → redirecting to /");
           window.location.replace("/");
         }
-      });
-
-      // ── 关键保护：确保原生登录表单不会被误拦截 ────────
-      // 1. 主动修复登录表单的 action（如果被错误修改）
-      function fixLoginFormAction() {
-        // 查找所有可能的登录表单
-        const loginForms = document.querySelectorAll(
-          'form[action*="/session"], form.login-form, form#login-form, form[data-login-form]'
-        );
-        
-        loginForms.forEach((form) => {
-          const action = form.getAttribute("action") || "";
-          // 如果表单的 action 被错误地改成了 /custom-sso/login，修复它
-          if (action.includes("/custom-sso/login")) {
-            // eslint-disable-next-line no-console
-            console.warn("[custom-sso] 检测到登录表单 action 被错误修改，正在修复...");
-            // 恢复为正确的 Discourse 登录端点
-            form.setAttribute("action", "/session");
-            // eslint-disable-next-line no-console
-            console.log("[custom-sso] 已修复登录表单 action 为 /session");
-          }
-        });
-      }
-      
-      // 2. 监听表单提交，进行最后的安全检查
-      document.addEventListener("submit", function(e) {
-        const form = e.target;
-        if (!form || form.tagName !== "FORM") {
-          return;
-        }
-        
-        const action = form.getAttribute("action") || "";
-        const method = (form.getAttribute("method") || "GET").toUpperCase();
-        
-        // 如果是原生登录表单提交到 /session，确保不被拦截
-        if (action.includes("/session") && method === "POST") {
-          // eslint-disable-next-line no-console
-          console.log("[custom-sso] 检测到原生登录表单提交，确保不被拦截");
-          // 不做任何处理，让原生登录正常进行
-          return;
-        }
-        
-        // 如果表单被错误地提交到 /custom-sso/login，阻止它并修复
-        if (action.includes("/custom-sso/login") && method === "POST") {
-          // eslint-disable-next-line no-console
-          console.error("[custom-sso] 阻止了错误的表单提交到 /custom-sso/login");
-          e.preventDefault();
-          e.stopPropagation();
-          
-          // 尝试修复表单 action
-          if (form.querySelector('input[name="username"], input[name="login"]')) {
-            // 这看起来是登录表单，修复它的 action
-            form.setAttribute("action", "/session");
-            // eslint-disable-next-line no-console
-            console.log("[custom-sso] 已修复表单 action，请重新提交");
-          }
-          
-          return false;
-        }
-      }, true); // 使用捕获阶段，确保优先处理
-      
-      // 3. 定期检查并修复登录表单（防止被其他代码修改）
-      setInterval(fixLoginFormAction, 1000);
-      
-      // 4. 在 DOM 变化时也检查并修复
-      const formObserver = new MutationObserver(() => {
-        fixLoginFormAction();
-      });
-      
-      formObserver.observe(document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ["action"]
       });
 
       // ── 只插入 SSO 按钮，不修改任何其他元素，不影响原生登录 ────────
@@ -267,7 +188,7 @@ export default {
         btn.className = "btn btn-primary custom-sso-btn";
         btn.type = "button"; // 关键：type="button" 确保不会触发表单提交
         btn.textContent = "统一身份认证";
-        btn.setAttribute("data-custom-sso", "true"); // 明确标识这是 SSO 按钮
+        btn.setAttribute("data-custom-sso", "true");
         btn.style.marginBottom = "10px";
 
         // 只监听 SSO 按钮的点击事件
@@ -278,16 +199,15 @@ export default {
           // eslint-disable-next-line no-console
           console.log("[custom-sso] 用户点击了统一身份认证按钮");
           
-          // 跳转到 SSO 登录
-          const loginPath = window.location.origin + "/custom-sso/login";
-          window.location.replace(loginPath);
+          // 使用全页面导航跳转到 SSO 登录（不经过 pushState，不会被拦截）
+          window.location.href = window.location.origin + "/custom-sso/login";
         });
 
         // 插入到容器最前面
         container.prepend(btn);
 
         // eslint-disable-next-line no-console
-        console.log("[custom-sso] SSO 按钮已插入 - 不影响原生登录功能");
+        console.log("[custom-sso] SSO 按钮已插入");
       }
 
       // SPA 路由切到 /login 时，尝试插一次
@@ -301,7 +221,6 @@ export default {
       setTimeout(insertSsoButton, 100);
 
       // 监听 DOM 变化（登录弹窗 / 切 tab / 异步渲染等）
-      // 注意：只用于插入按钮，不修改任何其他元素
       const observer = new MutationObserver(() => {
         insertSsoButton();
       });
