@@ -57,22 +57,34 @@ class CustomSsoController < ::ApplicationController
       return
     end
     
-    # ── 关键保护：只接受 GET 请求，拒绝 POST 请求 ────────
+    # ── 关键保护：处理非 GET 请求 ────────
     # 原生登录表单提交是 POST 请求，不应该到达这里
     # 如果收到 POST 请求，可能是：
     # 1. Discourse 原生登录表单被错误地提交到这里
-    # 2. 后台配置了某些参数导致登录表单 action 被修改
+    # 2. Discourse 登录成功后把 /custom-sso/login 作为 return_path，导致重定向到这里
     # 3. 其他插件或中间件拦截了请求
     if request.method != "GET"
-      Rails.logger.error("CustomSSO: login action received non-GET request (#{request.method})")
-      Rails.logger.error("CustomSSO: This should not happen!")
+      Rails.logger.warn("CustomSSO: login action received non-GET request (#{request.method})")
+      Rails.logger.warn("CustomSSO: current_user=#{current_user&.username || 'anonymous'}")
+      Rails.logger.warn("CustomSSO: referer=#{request.referer}")
+      Rails.logger.warn("CustomSSO: params=#{params.inspect}")
+      
+      # 如果用户已经登录，说明可能是 Discourse 登录成功后的重定向
+      # 这种情况下应该重定向到首页，而不是返回错误
+      if current_user
+        Rails.logger.info("CustomSSO: POST request received but user already logged in as #{current_user.username}; redirecting to home")
+        redirect_to "#{discourse_base}/", allow_other_host: true, status: 302
+        return
+      end
+      
+      # 如果用户未登录，说明可能是表单被错误提交到这里
+      Rails.logger.error("CustomSSO: POST request received but user not logged in!")
       Rails.logger.error("CustomSSO: Possible causes:")
       Rails.logger.error("CustomSSO:   1. Login form action was modified by another plugin")
       Rails.logger.error("CustomSSO:   2. Discourse SSO settings conflict with custom SSO")
       Rails.logger.error("CustomSSO:   3. Middleware or route matching issue")
       Rails.logger.error("CustomSSO: Check Discourse admin settings for SSO-related configurations")
-      # 如果是 POST 请求，直接返回 405 Method Not Allowed，而不是重定向
-      # 这样可以避免重定向循环
+      # 返回 405 Method Not Allowed
       head :method_not_allowed
       return
     end
