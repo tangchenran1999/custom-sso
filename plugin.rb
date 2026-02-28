@@ -27,5 +27,28 @@ after_initialize do
     end
   end
 
+  # ── 3. 清除 session 中指向 /custom-sso/login 的 destination_url ──
+  #    Discourse 在用户未登录时访问某个页面会把该 URL 保存到
+  #    session["destination_url"]，登录成功后跳转到该 URL。
+  #    如果用户之前访问过 /custom-sso/login，这个 URL 会被保存，
+  #    导致原生登录成功后跳转到 /custom-sso/login（显示 404）。
+  #    这里在每次请求时检查并清除这个值。
+  ApplicationController.class_eval do
+    before_action :sanitize_custom_sso_destination_url
+
+    private
+
+    def sanitize_custom_sso_destination_url
+      dest = session["destination_url"].to_s
+      if dest.include?("/custom-sso/login")
+        Rails.logger.warn("[CustomSSO] Cleared session destination_url that pointed to /custom-sso/login: #{dest}")
+        session.delete("destination_url")
+      end
+    rescue => e
+      # 不要因为这个检查影响正常请求
+      Rails.logger.warn("[CustomSSO] Error in sanitize_custom_sso_destination_url: #{e.message}")
+    end
+  end
+
   Rails.logger.info("[CustomSSO] Plugin initialized — routes: /custom-sso/{login,callback,complete-profile,create-account}")
 end
