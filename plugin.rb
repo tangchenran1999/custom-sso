@@ -15,10 +15,7 @@ after_initialize do
   require_relative "app/controllers/custom_sso_controller"
 
   # ── 2. 注册路由 ──────────────────────────────────────
-  #    使用 prepend 确保优先于 Discourse 的 catch-all 路由。
-  #    添加 constraints 确保只匹配 HTML 格式请求。
   Discourse::Application.routes.prepend do
-    # 所有 /custom-sso/* 路由都指向 CustomSsoController
     scope "/custom-sso", defaults: { format: :html } do
       get  "login"            => "custom_sso#login"
       get  "callback"         => "custom_sso#callback"
@@ -27,26 +24,36 @@ after_initialize do
     end
   end
 
-  # ── 3. 清除 session 中指向 /custom-sso/login 的 destination_url ──
-  #    Discourse 在用户未登录时访问某个页面会把该 URL 保存到
-  #    session["destination_url"]，登录成功后跳转到该 URL。
-  #    如果用户之前访问过 /custom-sso/login，这个 URL 会被保存，
-  #    导致原生登录成功后跳转到 /custom-sso/login（显示 404）。
-  #    这里在每次请求时检查并清除这个值。
+  # ── 3. 从根源阻止 destination_url 指向 /custom-sso/login ──
+  #
+  #    问题：Discourse 在用户未登录时访问某个页面，会把该 URL 存到
+  #    session["destination_url"]。原生登录成功后，SessionController
+  #    返回这个 URL 给前端，前端跳转过去。
+  #
+  #    如果用户曾访问过 /custom-sso/login（比如点了"统一身份认证"
+  #    但没完成登录就回来了），这个 URL 就会被存下来，导致原生登录
+  #    成功后跳转到 /custom-sso/login（Ember 前端没有这个路由 → 404）。
+  #
+  #    解决：在每次请求的 before_action 中检查并清除它。
+  #    这样 SessionController#create 返回的 JSON 中就不会包含
+  #    /custom-sso/login 作为 destination_url。
+  #
+  #    注意：这个 before_action 加在 ApplicationController 上，
+  #    所有控制器都会继承，包括 SessionController。
+  #
   ApplicationController.class_eval do
-    before_action :sanitize_custom_sso_destination_url
+    before_action :_custom_sso_sanitize_destination_url
 
     private
 
-    def sanitize_custom_sso_destination_url
+    def _custom_sso_sanitize_destination_url
       dest = session["destination_url"].to_s
-      if dest.include?("/custom-sso/login")
-        Rails.logger.warn("[CustomSSO] Cleared session destination_url that pointed to /custom-sso/login: #{dest}")
+      if dest.include?("/custom-sso/")
+        Rails.logger.info("[CustomSSO] Clearing bad destination_url from session: #{dest}")
         session.delete("destination_url")
       end
     rescue => e
-      # 不要因为这个检查影响正常请求
-      Rails.logger.warn("[CustomSSO] Error in sanitize_custom_sso_destination_url: #{e.message}")
+      Rails.logger.warn("[CustomSSO] Error in _custom_sso_sanitize_destination_url: #{e.message}")
     end
   end
 
