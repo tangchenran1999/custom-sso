@@ -10,19 +10,21 @@ export default {
 
       // ── 防止原生登录成功后回跳到 /custom-sso/login ─────────
       // 有些情况下（例如之前访问过 /custom-sso/login），Discourse 会把它保存成登录后的 redirect/return_path。
-      // 用户选择“原生登录”时，这会导致登录成功后又被带回 /custom-sso/login。
+      // 用户选择"原生登录"时，这会导致登录成功后又被带回 /custom-sso/login。
       // 这里在 /login 页面把这种 redirect 参数改写成 "/"，避免回跳。
-      if (window.location.pathname === "/login") {
+      function sanitizeLoginRedirectParams() {
         try {
           const u = new URL(window.location.href);
-          const keys = ["redirect", "return_path", "destination_url"];
+          const keys = ["redirect", "return_path", "destination_url", "return_to"];
           let changed = false;
 
           keys.forEach((k) => {
             const v = u.searchParams.get(k);
-            if (v && v.includes("/custom-sso/login")) {
+            if (v && (v.includes("/custom-sso/login") || v === "/custom-sso/login")) {
               u.searchParams.set(k, "/");
               changed = true;
+              // eslint-disable-next-line no-console
+              console.warn(`[custom-sso] sanitized ${k} parameter from ${v} to /`);
             }
           });
 
@@ -40,6 +42,22 @@ export default {
           console.warn("[custom-sso] failed to sanitize login redirect params", e);
         }
       }
+
+      // 在 /login 页面立即执行
+      if (window.location.pathname === "/login") {
+        sanitizeLoginRedirectParams();
+      }
+
+      // 监听 URL 变化（SPA 路由切换）
+      let lastUrl = window.location.href;
+      setInterval(() => {
+        if (window.location.href !== lastUrl) {
+          lastUrl = window.location.href;
+          if (window.location.pathname === "/login") {
+            sanitizeLoginRedirectParams();
+          }
+        }
+      }, 100);
 
       // ── 关键修复：如果当前 URL 是 /custom-sso/* 后端路由，
       //    说明 Discourse 的 Ember SPA 错误地拦截了本应由 Rails 处理的请求。
@@ -61,6 +79,59 @@ export default {
         }
         return;
       }
+
+      // ── 监听登录成功事件，防止跳转到 /custom-sso/login ────────
+      // Discourse 登录成功后可能会跳转到之前访问过的 URL
+      // 如果这个 URL 是 /custom-sso/login，我们需要拦截并重定向到首页
+      function interceptLoginSuccessRedirect() {
+        // 监听所有导航事件
+        const originalPushState = history.pushState;
+        const originalReplaceState = history.replaceState;
+        
+        function checkAndFixUrl(url) {
+          if (typeof url === 'string' && url.includes('/custom-sso/login')) {
+            // eslint-disable-next-line no-console
+            console.warn("[custom-sso] intercepted redirect to /custom-sso/login, redirecting to / instead");
+            return url.replace(/\/custom-sso\/login[^?]*/, '/').replace(/\/custom-sso\/login/, '/');
+          }
+          return url;
+        }
+        
+        history.pushState = function(...args) {
+          if (args[2]) {
+            args[2] = checkAndFixUrl(args[2]);
+          }
+          return originalPushState.apply(this, args);
+        };
+        
+        history.replaceState = function(...args) {
+          if (args[2]) {
+            args[2] = checkAndFixUrl(args[2]);
+          }
+          return originalReplaceState.apply(this, args);
+        };
+        
+        // 监听 popstate 事件（浏览器前进/后退）
+        window.addEventListener('popstate', () => {
+          if (window.location.pathname === '/custom-sso/login') {
+            // eslint-disable-next-line no-console
+            console.warn("[custom-sso] detected navigation to /custom-sso/login via popstate, redirecting to /");
+            window.location.replace('/');
+          }
+        });
+        
+        // 定期检查当前 URL（作为最后一道防线）
+        setInterval(() => {
+          if (window.location.pathname === '/custom-sso/login' && document.cookie.includes('_t=')) {
+            // 如果已经登录但还在 /custom-sso/login 页面，重定向到首页
+            // eslint-disable-next-line no-console
+            console.warn("[custom-sso] user is logged in but on /custom-sso/login page, redirecting to /");
+            window.location.replace('/');
+          }
+        }, 500);
+      }
+      
+      interceptLoginSuccessRedirect();
 
       // ── 关键保护：确保原生登录表单不会被误拦截 ────────
       // 1. 主动修复登录表单的 action（如果被错误修改）
