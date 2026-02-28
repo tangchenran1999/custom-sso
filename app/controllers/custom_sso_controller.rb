@@ -381,78 +381,111 @@ class CustomSsoController < ::ApplicationController
       end
 
       # ── 验证密码 ──────────────────────────────────────────
+      if password.present? && password.length > User.max_password_length
+        render html: complete_profile_html(username, name, email, "密码过长", profile_token).html_safe, layout: false
+        return
+      end
+      
       if password.length < 8
         render html: complete_profile_html(username, name, email, "密码长度至少 8 位", profile_token).html_safe, layout: false
         return
       end
 
-      # ── 检查用户名和邮箱是否已存在 ────────────────────────
-      if User.exists?(username: final_username)
-        render html: complete_profile_html(username, name, email, "该用户名已被使用，请联系管理员", profile_token).html_safe, layout: false
+      # ── 验证邮箱长度 ──────────────────────────────────────
+      if email.length > 254 + 1 + 253
+        render html: complete_profile_html(username, name, email, "邮箱地址过长", profile_token).html_safe, layout: false
         return
       end
 
-      # Discourse 中邮箱存储在 user_emails 表中，需要使用正确的方法检查
-      if UserEmail.exists?(email: email.to_s.strip.downcase)
-        render html: complete_profile_html(username, name, email, "该邮箱已被其他用户使用", profile_token).html_safe, layout: false
+      # ── 检查用户名冲突（参考官方源码） ────────────────────
+      # 检查是否与现有路由冲突
+      if Discourse::Application.routes.recognize_path("/#{final_username}") rescue nil
+        render html: complete_profile_html(username, name, email, "该用户名与现有路由冲突", profile_token).html_safe, layout: false
+        return
+      end
+      
+      if User.reserved_username?(final_username)
+        render html: complete_profile_html(username, name, email, "该用户名已被保留", profile_token).html_safe, layout: false
         return
       end
 
-      # ── 创建用户 ──────────────────────────────────────────
+      # ── 创建用户（参考 Discourse 官方源码） ────────────────
       Rails.logger.info("CustomSSO: attempting to create user — email=#{email}, username=#{final_username}, name=#{name}")
       
-      # 使用 Discourse 的 UserCreator 服务创建用户
-      # 第一个参数是当前用户（nil 表示系统创建），第二个参数是用户属性
-      # 注意：需要提供 ip_address，否则可能报错
-      ip_address = begin
-        request.remote_ip
-      rescue => e
-        Rails.logger.warn("CustomSSO: failed to get remote_ip: #{e.message}")
-        "127.0.0.1"
-      end
-      
-      user_params = {
-        email: email,
+      # 准备用户参数（参考官方源码）
+      new_user_params = {
+        email: email.strip.downcase,
         username: final_username,
-        name: name,
-        password: password,
-        password_required: true,
-        active: true,
-        approved: true,
-        skip_email_validation: false,
-        ip_address: ip_address
+        name: name
       }
       
-      Rails.logger.info("CustomSSO: UserCreator params: #{user_params.except(:password).inspect}")
+      # 检查是否存在 staged user（临时用户）
+      user = User.where(staged: true).with_email(new_user_params[:email]).first
       
-      # 确保使用正确的 UserCreator 类
-      creator_class = defined?(::UserCreator) ? ::UserCreator : UserCreator
-      Rails.logger.info("CustomSSO: Using UserCreator class: #{creator_class}")
+      if user
+        # 如果存在 staged user，取消 staged 状态并激活
+        user.active = false
+        user.unstage!
+        Rails.logger.info("CustomSSO: found staged user, unstaging — id=#{user.id}")
+      else
+        # 创建新用户
+        user = User.new
+        Rails.logger.info("CustomSSO: creating new user")
+      end
       
-      creator = creator_class.new(nil, user_params)
+      # 设置用户属性
+      user.attributes = new_user_params
       
-      Rails.logger.info("CustomSSO: UserCreator initialized, calling create...")
-      result = creator.create
+      # 设置密码（如果提供）
+      if password.present?
+        user.password = password
+      end
       
-      Rails.logger.info("CustomSSO: UserCreator.create returned — success=#{result.success?}, user=#{result.user&.id}")
+      # SSO 用户默认设置为 active 和 approved（参考官方源码逻辑）
+      user.active = true
       
-      unless result.success?
-        error_message = result.errors.full_messages.join(", ")
-        Rails.logger.error("CustomSSO: UserCreator failed — #{error_message}")
-        Rails.logger.error("CustomSSO: UserCreator result: #{result.inspect}")
-        if result.errors.respond_to?(:full_messages)
-          Rails.logger.error("CustomSSO: UserCreator errors: #{result.errors.full_messages.inspect}")
-        end
-        render html: complete_profile_html(username, name, email, "创建用户失败: #{error_message}", profile_token).html_safe, layout: false
+      # 自动批准用户（参考官方源码）
+      if user.approved? || EmailValidator.can_auto_approve_user?(user.email)
+        ReviewableUser.set_approved_fields!(user, nil)
+        Rails.logger.info("CustomSSO: auto-approved user based on email domain")
+      end
+      
+      # 使用 UserAuthenticator 处理认证（参考官方源码）
+      authentication = UserAuthenticator.new(user, session)
+      authentication.start
+      
+      if authentication.email_valid? && !authentication.authenticated?
+        Rails.logger.error("CustomSSO: authentication failed — email_valid=#{authentication.email_valid?}, authenticated=#{authentication.authenticated?}")
+        render html: complete_profile_html(username, name, email, "认证失败", profile_token).html_safe, layout: false
         return
       end
       
-      user = result.user
+      # 使用 UserActivator 处理激活（参考官方源码）
+      activation = UserActivator.new(user, request, session, cookies)
+      activation.start
       
-      unless user
-        Rails.logger.error("CustomSSO: UserCreator returned success but user is nil")
-        Rails.logger.error("CustomSSO: UserCreator result object: #{result.inspect}")
-        render html: complete_profile_html(username, name, email, "创建用户失败: 用户对象为空", profile_token).html_safe, layout: false
+      # 保存用户
+      if user.save
+        authentication.finish
+        activation.finish
+        
+        Rails.logger.info("CustomSSO: user saved successfully — id=#{user.id}, email=#{email}, username=#{final_username}")
+        
+        # 如果用户被创建为 active，激活用户（参考官方源码）
+        if user.active?
+          user.activate
+          Rails.logger.info("CustomSSO: user activated — id=#{user.id}")
+        end
+      else
+        # 处理保存失败
+        errors = user.errors.to_hash
+        errors[:email] = errors.delete(:primary_email) if errors[:primary_email]
+        error_message = user.errors.full_messages.join(", ")
+        
+        Rails.logger.error("CustomSSO: failed to save user — #{error_message}")
+        Rails.logger.error("CustomSSO: user errors: #{errors.inspect}")
+        
+        render html: complete_profile_html(username, name, email, "创建用户失败: #{error_message}", profile_token).html_safe, layout: false
         return
       end
       
