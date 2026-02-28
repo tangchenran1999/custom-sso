@@ -26,6 +26,15 @@ class CustomSsoController < ::ApplicationController
   skip_before_action :check_restricted_access,     raise: false
   skip_before_action :block_if_maintenance_mode,   raise: false
 
+  # ── 关键：清除 session 中的 destination_url ──────────
+  # Discourse 的 ApplicationController 会自动把当前请求 URL 存到
+  # session["destination_url"]，这样用户登录后会跳转回来。
+  # 但 /custom-sso/login 和 /custom-sso/callback 是 SSO 流程的中间页面，
+  # 不应该被当作"用户想回去的页面"。
+  # 如果不清除，用户点了"统一身份认证"但没完成 SSO，回去用原生方式登录时，
+  # Discourse 会把他跳转到 /custom-sso/login，导致两套登录流程互相干扰。
+  before_action :_clear_destination_url
+
   # 允许匿名访问（Discourse 内部检查）
   def self.allows_anonymous?
     true
@@ -583,6 +592,17 @@ class CustomSsoController < ::ApplicationController
   end
 
   private
+
+  # ── 清除 destination_url ────────────────────────────────
+  # 只要请求进入了 CustomSsoController，就把 session["destination_url"] 清掉。
+  # 这样原生登录流程就不会被 /custom-sso/* 的 URL 污染。
+  def _clear_destination_url
+    dest = session["destination_url"].to_s
+    if dest.include?("/custom-sso/")
+      Rails.logger.info("[CustomSSO] Clearing destination_url from session: #{dest}")
+      session.delete("destination_url")
+    end
+  end
 
   # ── 辅助方法 ────────────────────────────────────────────
 
