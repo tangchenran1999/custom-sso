@@ -101,27 +101,8 @@ export default {
           return;
         }
 
-        // ── 关键保护：确保不会修改或影响原生登录表单 ────────
-        // 查找所有登录表单，确保它们的action属性不被修改
-        const loginForms = document.querySelectorAll('form[action*="/login"], form[action*="/session"], form[action*="session"]');
-        loginForms.forEach((form) => {
-          // 确保表单的action属性不被修改
-          const originalAction = form.getAttribute("action");
-          if (originalAction && !originalAction.includes("/custom-sso/")) {
-            // 如果表单的action被错误地修改了，恢复它
-            if (form.getAttribute("data-original-action")) {
-              form.setAttribute("action", form.getAttribute("data-original-action"));
-            } else {
-              // 保存原始action，以防万一
-              form.setAttribute("data-original-action", originalAction);
-            }
-          } else if (!originalAction || originalAction === '') {
-            // 如果没有 action 属性，确保设置为 /session（Discourse 默认）
-            if (!form.getAttribute("data-original-action")) {
-              form.setAttribute("data-original-action", "/session");
-            }
-          }
-        });
+        // 注意：不再主动查找和修改登录表单，避免干扰 Discourse 的正常处理
+        // 只通过拦截 fetch/XHR 来保护，不直接操作表单
 
         const btn = document.createElement("button");
         btn.className = "btn btn-primary custom-sso-btn";
@@ -151,63 +132,8 @@ export default {
         // 放到最前面
         container.prepend(btn);
 
-        // ── 额外保护：监听表单提交，确保原生登录表单不会被错误提交到 /custom-sso/login ────────
-        loginForms.forEach((form) => {
-          // 确保表单的 action 始终正确
-          const checkAndFixAction = () => {
-            const currentAction = form.getAttribute("action") || form.action;
-            const originalAction = form.getAttribute("data-original-action") || "/session";
-            
-            if (currentAction && currentAction.includes("/custom-sso/login")) {
-              // eslint-disable-next-line no-console
-              console.error("[custom-sso] 检测到表单 action 被错误设置为 /custom-sso/login，正在恢复");
-              form.setAttribute("action", originalAction);
-            } else if (!currentAction || currentAction === '') {
-              form.setAttribute("action", originalAction);
-            }
-          };
-          
-          // 立即检查一次
-          checkAndFixAction();
-          
-          // 监听表单提交
-          form.addEventListener("submit", (e) => {
-            checkAndFixAction();
-            const formAction = form.getAttribute("action") || form.action;
-            // eslint-disable-next-line no-console
-            console.log("[custom-sso] 检测到表单提交，action:", formAction);
-            
-            // 如果表单的action被错误地设置为 /custom-sso/login，阻止提交并恢复
-            if (formAction && formAction.includes("/custom-sso/login")) {
-              // eslint-disable-next-line no-console
-              console.error("[custom-sso] 错误：原生登录表单的action被设置为 /custom-sso/login，已阻止并恢复");
-              e.preventDefault();
-              e.stopPropagation();
-              
-              // 恢复原始action
-              const originalAction = form.getAttribute("data-original-action") || "/session";
-              form.setAttribute("action", originalAction);
-              // eslint-disable-next-line no-console
-              console.log("[custom-sso] 已恢复表单action为:", originalAction);
-              
-              return false;
-            }
-          }, true); // 使用捕获阶段，确保优先处理
-          
-          // 使用 MutationObserver 监听表单 action 属性的变化
-          const formObserver = new MutationObserver((mutations) => {
-            mutations.forEach((mutation) => {
-              if (mutation.type === 'attributes' && mutation.attributeName === 'action') {
-                checkAndFixAction();
-              }
-            });
-          });
-          
-          formObserver.observe(form, {
-            attributes: true,
-            attributeFilter: ['action']
-          });
-        });
+        // 注意：不再直接监听表单提交，避免干扰 Discourse 的正常处理和 CSRF token 传递
+        // 保护措施已通过拦截 fetch/XHR 实现，这已经足够防止错误的请求到达后端
 
         // eslint-disable-next-line no-console
         console.log("[custom-sso] button inserted - 注意：此按钮仅用于统一身份认证，不影响原生登录/注册功能");
