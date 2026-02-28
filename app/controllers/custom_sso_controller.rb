@@ -395,16 +395,38 @@ class CustomSsoController < ::ApplicationController
 
     # ── 创建用户 ──────────────────────────────────────────
     begin
-      user = User.create!(
-        email:                 email,
-        username:              final_username,
-        name:                  name,  # 使用认证平台返回的显示名称
-        password:              password,
-        password_confirmation: password,
-        active:                true,
-        approved:              true
-      )
-
+      # 使用 Discourse 的 UserCreator 服务创建用户
+      # 第一个参数是当前用户（nil 表示系统创建），第二个参数是用户属性
+      creator = UserCreator.new(nil, {
+        email: email,
+        username: final_username,
+        name: name,
+        password: password,
+        password_required: true,
+        active: true,
+        approved: true,
+        skip_email_validation: false,
+        created_at: Time.zone.now
+      })
+      
+      result = creator.create
+      
+      unless result.success?
+        error_message = result.errors.full_messages.join(", ")
+        Rails.logger.error("CustomSSO: UserCreator failed — #{error_message}")
+        Rails.logger.error("CustomSSO: UserCreator result: #{result.inspect}")
+        render html: complete_profile_html(username, name, email, "创建用户失败: #{error_message}", profile_token).html_safe, layout: false
+        return
+      end
+      
+      user = result.user
+      
+      unless user
+        Rails.logger.error("CustomSSO: UserCreator returned success but user is nil")
+        render html: complete_profile_html(username, name, email, "创建用户失败: 用户对象为空", profile_token).html_safe, layout: false
+        return
+      end
+      
       Rails.logger.info("CustomSSO: created new user — id=#{user.id}, email=#{email}, username=#{final_username}, name=#{name}")
 
       # 清除 Redis 中的临时数据
@@ -563,120 +585,142 @@ class CustomSsoController < ::ApplicationController
           * { margin: 0; padding: 0; box-sizing: border-box; }
           body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background: #f5f6f7;
+            background: var(--secondary, #f5f6f7);
             display: flex;
             justify-content: center;
             align-items: center;
             min-height: 100vh;
+            padding: 20px;
           }
-          .card {
-            background: #fff;
-            border-radius: 12px;
-            box-shadow: 0 2px 16px rgba(0,0,0,0.10);
-            padding: 40px 36px;
+          .d-form-container {
+            background: var(--secondary, #ffffff);
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 2em;
             width: 100%;
-            max-width: 420px;
+            max-width: 500px;
           }
-          .card h2 {
+          .d-form-container h2 {
             text-align: center;
-            margin-bottom: 8px;
-            color: #222;
-            font-size: 22px;
+            margin-bottom: 0.5em;
+            color: var(--primary, #222222);
+            font-size: 1.5em;
+            font-weight: 600;
           }
-          .card .subtitle {
+          .d-form-container .subtitle {
             text-align: center;
-            color: #888;
-            font-size: 14px;
-            margin-bottom: 28px;
+            color: var(--primary-medium, #666666);
+            font-size: 0.875em;
+            margin-bottom: 1.5em;
           }
-          .field { margin-bottom: 20px; }
-          .field label {
+          .d-form {
+            margin-top: 1.5em;
+          }
+          .d-form .form-group {
+            margin-bottom: 1.25em;
+          }
+          .d-form .control-label {
             display: block;
-            font-size: 14px;
-            color: #555;
-            margin-bottom: 6px;
+            font-size: 0.875em;
+            color: var(--primary, #222222);
+            margin-bottom: 0.5em;
             font-weight: 500;
           }
-          .field input {
+          .d-form .form-control {
             width: 100%;
-            padding: 10px 14px;
-            border: 1px solid #d1d5db;
-            border-radius: 8px;
-            font-size: 15px;
+            padding: 0.75em;
+            border: 1px solid var(--primary-low, #e0e0e0);
+            border-radius: 4px;
+            font-size: 1em;
             outline: none;
-            transition: border-color 0.2s;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            background: var(--secondary, #ffffff);
+            color: var(--primary, #222222);
           }
-          .field input:focus {
-            border-color: #0078d4;
-            box-shadow: 0 0 0 2px rgba(0,120,212,0.15);
+          .d-form .form-control:focus {
+            border-color: var(--tertiary, #0e72ed);
+            box-shadow: 0 0 0 2px rgba(14, 114, 237, 0.1);
           }
-          .field input[readonly] {
-            background: #f3f4f6;
-            color: #888;
+          .d-form .form-control[readonly] {
+            background: var(--primary-very-low, #f5f5f5);
+            color: var(--primary-medium, #666666);
             cursor: not-allowed;
           }
-          .error-msg {
-            background: #fef2f2;
-            color: #dc2626;
-            border: 1px solid #fecaca;
-            border-radius: 8px;
-            padding: 10px 14px;
-            font-size: 14px;
-            margin-bottom: 20px;
+          .d-form .alert {
+            background: var(--danger-low, #ffe6e6);
+            color: var(--danger, #e45735);
+            border: 1px solid var(--danger-low-mid, #ffcccc);
+            border-radius: 4px;
+            padding: 0.75em;
+            font-size: 0.875em;
+            margin-bottom: 1.25em;
           }
-          .submit-btn {
+          .d-form .btn {
             width: 100%;
-            padding: 12px;
-            background: #0078d4;
-            color: #fff;
+            padding: 0.75em 1em;
+            font-size: 1em;
+            font-weight: 500;
             border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
+            border-radius: 4px;
             cursor: pointer;
-            transition: background 0.2s;
-          }
-          .submit-btn:hover { background: #005a9e; }
-          .submit-btn:active { background: #004578; }
-          .tip {
+            transition: background-color 0.2s, opacity 0.2s;
             text-align: center;
-            margin-top: 16px;
-            font-size: 13px;
-            color: #999;
+            display: inline-block;
+            line-height: 1.5;
+          }
+          .d-form .btn-primary {
+            background: var(--tertiary, #0e72ed);
+            color: var(--secondary, #ffffff);
+          }
+          .d-form .btn-primary:hover {
+            background: var(--tertiary-hover, #0c5fc7);
+          }
+          .d-form .btn-primary:active {
+            background: var(--tertiary-low, #0a4fa0);
+          }
+          .d-form .form-hint {
+            text-align: center;
+            margin-top: 1em;
+            font-size: 0.8125em;
+            color: var(--primary-medium, #666666);
+          }
+          .required {
+            color: var(--danger, #e45735);
           }
         </style>
       </head>
       <body>
-        <div class="card">
+        <div class="d-form-container">
           <h2>完善账户信息</h2>
           <p class="subtitle">首次通过统一身份认证登录，请补全以下信息</p>
 
-          #{error_msg ? "<div class=\"error-msg\">#{ERB::Util.html_escape(error_msg)}</div>" : ""}
-
-          <form method="POST" action="#{base_url}/custom-sso/create-account">
+          <form method="POST" action="#{base_url}/custom-sso/create-account" class="d-form">
             #{token ? "<input type=\"hidden\" name=\"token\" value=\"#{ERB::Util.html_escape(token)}\" />" : ""}
-            <div class="field">
-              <label>用户名</label>
-              <input type="text" value="#{ERB::Util.html_escape(username)}" 
-                     readonly style="background:#f3f4f6; color:#888; cursor:not-allowed;" />
+            
+            #{error_msg ? "<div class=\"alert\">#{ERB::Util.html_escape(error_msg)}</div>" : ""}
+
+            <div class="form-group">
+              <label class="control-label">用户名</label>
+              <input type="text" class="form-control" value="#{ERB::Util.html_escape(username)}" 
+                     readonly />
               <input type="hidden" name="username" value="#{ERB::Util.html_escape(username)}" />
             </div>
 
-            <div class="field">
-              <label>邮箱 <span style="color:#dc2626">*</span></label>
-              <input type="email" name="email" value="#{ERB::Util.html_escape(email)}"
+            <div class="form-group">
+              <label class="control-label">邮箱 <span class="required">*</span></label>
+              <input type="email" name="email" class="form-control" value="#{ERB::Util.html_escape(email)}"
                      placeholder="请输入您的邮箱地址" required />
             </div>
 
-            <div class="field">
-              <label>设置密码 <span style="color:#dc2626">*</span></label>
-              <input type="password" name="password" placeholder="至少 8 位" minlength="8" required />
+            <div class="form-group">
+              <label class="control-label">设置密码 <span class="required">*</span></label>
+              <input type="password" name="password" class="form-control" placeholder="至少 8 位" minlength="8" required />
             </div>
 
-            <button type="submit" class="submit-btn">完成注册并登录</button>
+            <button type="submit" class="btn btn-primary">完成注册并登录</button>
           </form>
 
-          <p class="tip">密码用于后续直接登录 Discourse（也可以始终使用统一身份认证登录）</p>
+          <p class="form-hint">密码用于后续直接登录 Discourse（也可以始终使用统一身份认证登录）</p>
         </div>
       </body>
       </html>
