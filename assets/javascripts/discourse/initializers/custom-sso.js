@@ -36,7 +36,7 @@ export default {
         if (!container) return;
 
         const btn = document.createElement("button");
-        btn.className = "btn btn-primary custom-sso-btn";
+        btn.className = "btn btn-large btn-primary custom-sso-btn";
         btn.type = "button";
         btn.textContent = "统一身份认证";
         btn.style.cssText = "margin-bottom:10px;width:100%;";
