@@ -34,6 +34,58 @@ export default {
         return;
       }
 
+      // ── 全局保护：拦截所有可能错误提交到 /custom-sso/login 的请求 ────────
+      // Discourse 使用 AJAX 提交登录表单，所以需要拦截 fetch 和 XMLHttpRequest
+      (function() {
+        // 保存原始的 fetch
+        const originalFetch = window.fetch;
+        window.fetch = function(...args) {
+          const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+          const method = args[1]?.method || args[0]?.method || 'GET';
+          
+          // 如果请求 URL 包含 /custom-sso/login，且不是 GET 请求，阻止它
+          if (url && url.includes('/custom-sso/login')) {
+            if (method.toUpperCase() !== 'GET') {
+              // eslint-disable-next-line no-console
+              console.error("[custom-sso] 阻止了错误的 fetch", method, "请求到 /custom-sso/login，URL:", url);
+              return Promise.reject(new Error("不允许非 GET 请求到 /custom-sso/login"));
+            }
+          }
+          
+          return originalFetch.apply(this, args);
+        };
+
+        // 拦截 XMLHttpRequest（Discourse 可能使用）
+        const originalXHROpen = XMLHttpRequest.prototype.open;
+        const originalXHRSend = XMLHttpRequest.prototype.send;
+        
+        // 重写 open 方法以保存 method 和 url，并检查
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          this._method = method;
+          this._url = url;
+          
+          // 如果请求 URL 包含 /custom-sso/login，且不是 GET 请求，阻止它
+          if (typeof url === 'string' && url.includes('/custom-sso/login') && method.toUpperCase() !== 'GET') {
+            // eslint-disable-next-line no-console
+            console.error("[custom-sso] 阻止了错误的 XHR", method, "请求到 /custom-sso/login，URL:", url);
+            throw new Error("不允许非 GET 请求到 /custom-sso/login");
+          }
+          
+          return originalXHROpen.apply(this, [method, url, ...rest]);
+        };
+        
+        // 拦截 XMLHttpRequest 的 send 方法（额外保护）
+        XMLHttpRequest.prototype.send = function(...args) {
+          const url = this._url || '';
+          if (url && url.includes('/custom-sso/login') && this._method && this._method.toUpperCase() !== 'GET') {
+            // eslint-disable-next-line no-console
+            console.error("[custom-sso] 阻止了错误的 XHR send", this._method, "请求到 /custom-sso/login");
+            throw new Error("不允许非 GET 请求到 /custom-sso/login");
+          }
+          return originalXHRSend.apply(this, args);
+        };
+      })();
+
       function insertSsoButton() {
         // 已经有就不重复插
         if (document.querySelector(".custom-sso-btn")) {
@@ -51,7 +103,7 @@ export default {
 
         // ── 关键保护：确保不会修改或影响原生登录表单 ────────
         // 查找所有登录表单，确保它们的action属性不被修改
-        const loginForms = document.querySelectorAll('form[action*="/login"], form[action*="/session"]');
+        const loginForms = document.querySelectorAll('form[action*="/login"], form[action*="/session"], form[action*="session"]');
         loginForms.forEach((form) => {
           // 确保表单的action属性不被修改
           const originalAction = form.getAttribute("action");
@@ -62,6 +114,11 @@ export default {
             } else {
               // 保存原始action，以防万一
               form.setAttribute("data-original-action", originalAction);
+            }
+          } else if (!originalAction || originalAction === '') {
+            // 如果没有 action 属性，确保设置为 /session（Discourse 默认）
+            if (!form.getAttribute("data-original-action")) {
+              form.setAttribute("data-original-action", "/session");
             }
           }
         });
@@ -96,7 +153,26 @@ export default {
 
         // ── 额外保护：监听表单提交，确保原生登录表单不会被错误提交到 /custom-sso/login ────────
         loginForms.forEach((form) => {
+          // 确保表单的 action 始终正确
+          const checkAndFixAction = () => {
+            const currentAction = form.getAttribute("action") || form.action;
+            const originalAction = form.getAttribute("data-original-action") || "/session";
+            
+            if (currentAction && currentAction.includes("/custom-sso/login")) {
+              // eslint-disable-next-line no-console
+              console.error("[custom-sso] 检测到表单 action 被错误设置为 /custom-sso/login，正在恢复");
+              form.setAttribute("action", originalAction);
+            } else if (!currentAction || currentAction === '') {
+              form.setAttribute("action", originalAction);
+            }
+          };
+          
+          // 立即检查一次
+          checkAndFixAction();
+          
+          // 监听表单提交
           form.addEventListener("submit", (e) => {
+            checkAndFixAction();
             const formAction = form.getAttribute("action") || form.action;
             // eslint-disable-next-line no-console
             console.log("[custom-sso] 检测到表单提交，action:", formAction);
@@ -109,21 +185,28 @@ export default {
               e.stopPropagation();
               
               // 恢复原始action
-              const originalAction = form.getAttribute("data-original-action");
-              if (originalAction) {
-                form.setAttribute("action", originalAction);
-                // eslint-disable-next-line no-console
-                console.log("[custom-sso] 已恢复表单action为:", originalAction);
-              } else {
-                // 如果没有保存原始action，使用默认的Discourse登录路径
-                form.setAttribute("action", "/session");
-                // eslint-disable-next-line no-console
-                console.log("[custom-sso] 已设置表单action为默认值: /session");
-              }
+              const originalAction = form.getAttribute("data-original-action") || "/session";
+              form.setAttribute("action", originalAction);
+              // eslint-disable-next-line no-console
+              console.log("[custom-sso] 已恢复表单action为:", originalAction);
               
               return false;
             }
           }, true); // 使用捕获阶段，确保优先处理
+          
+          // 使用 MutationObserver 监听表单 action 属性的变化
+          const formObserver = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+              if (mutation.type === 'attributes' && mutation.attributeName === 'action') {
+                checkAndFixAction();
+              }
+            });
+          });
+          
+          formObserver.observe(form, {
+            attributes: true,
+            attributeFilter: ['action']
+          });
         });
 
         // eslint-disable-next-line no-console
