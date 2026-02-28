@@ -270,33 +270,65 @@ class CustomSsoController < ::ApplicationController
       # ── 新用户：首次登录，需要补全邮箱和设置密码 ────────
       Rails.logger.info("CustomSSO: new user detected — username=#{normalized_username}, redirecting to complete profile")
 
-      # 把认证信息存到 session 中，供 complete_profile 页面使用
-      session[:sso_pending_username] = normalized_username
-      session[:sso_pending_name]     = name.to_s.presence || normalized_username
-      session[:sso_pending_email]    = email.to_s.strip.downcase if email.present?
+      # 使用 Redis 存储临时用户信息（避免跨域重定向导致 session 丢失）
+      # 生成一个唯一的 token，用于后续页面获取用户信息
+      profile_token = SecureRandom.hex(32)
+      redis_key = "custom_sso_profile:#{profile_token}"
+      profile_data = {
+        username: normalized_username,
+        name: name.to_s.presence || normalized_username,
+        email: email.to_s.strip.downcase
+      }.to_json
+      
+      # 设置 15 分钟过期时间（足够用户填写表单）
+      Discourse.redis.setex(redis_key, 900, profile_data) # 900 秒 = 15 分钟
+      
+      Rails.logger.info("CustomSSO: saved profile data to Redis with key=#{redis_key}")
 
-      redirect_to "/custom-sso/complete-profile"
+      redirect_to "/custom-sso/complete-profile?token=#{profile_token}"
     end
   end
 
   # ──────────────────────────────────────────────────────────
-  # 3️⃣  GET /custom-sso/complete-profile
+  # 3️⃣  GET /custom-sso/complete-profile?token=xxx
   #
   #    首次登录的用户需要补全邮箱和设置密码。
   #    显示一个简单的表单页面。
   # ──────────────────────────────────────────────────────────
   def complete_profile
-    username = session[:sso_pending_username]
-    if username.blank?
+    profile_token = params[:token].to_s.strip
+    
+    if profile_token.blank?
+      Rails.logger.error("CustomSSO: complete_profile missing token param")
       redirect_to "/login"
       return
     end
 
-    name  = session[:sso_pending_name] || username
-    email = session[:sso_pending_email] || ""
+    # 从 Redis 中读取用户信息
+    redis_key = "custom_sso_profile:#{profile_token}"
+    redis_data = Discourse.redis.get(redis_key)
+    
+    if redis_data.blank?
+      Rails.logger.error("CustomSSO: profile token not found in Redis — key=#{redis_key}, token may be expired or invalid")
+      redirect_to "/login"
+      return
+    end
 
-    # 渲染一个独立的 HTML 页面（不走 Ember）
-    render html: complete_profile_html(username, name, email).html_safe, layout: false
+    begin
+      profile_data = JSON.parse(redis_data)
+      username = profile_data["username"]
+      name     = profile_data["name"] || username
+      email    = profile_data["email"] || ""
+      
+      Rails.logger.info("CustomSSO: loaded profile data from Redis — username=#{username}")
+      
+      # 将 token 传递给表单，以便 create_account 使用
+      render html: complete_profile_html(username, name, email, nil, profile_token).html_safe, layout: false
+    rescue JSON::ParserError => e
+      Rails.logger.error("CustomSSO: failed to parse profile data: #{e.message}")
+      redirect_to "/login"
+      return
+    end
   end
 
   # ──────────────────────────────────────────────────────────
@@ -305,59 +337,114 @@ class CustomSsoController < ::ApplicationController
   #    接收补全信息表单提交，创建用户并登录。
   # ──────────────────────────────────────────────────────────
   def create_account
-    username = session[:sso_pending_username]
-    name     = session[:sso_pending_name]
-
-    if username.blank?
-      render plain: "会话已过期，请重新登录", status: 400
+    profile_token = params[:token].to_s.strip
+    
+    if profile_token.blank?
+      render plain: "缺少验证令牌，请重新登录", status: 400
       return
     end
 
-    email    = params[:email].to_s.strip.downcase
-    password = params[:password].to_s
+    # 从 Redis 中读取用户信息
+    redis_key = "custom_sso_profile:#{profile_token}"
+    redis_data = Discourse.redis.get(redis_key)
+    
+    if redis_data.blank?
+      render plain: "验证令牌已过期或无效，请重新登录", status: 400
+      return
+    end
 
-    # ── 验证 ──────────────────────────────────────────────
+    begin
+      profile_data = JSON.parse(redis_data)
+      username = profile_data["username"]
+      name     = profile_data["name"] || username
+    rescue JSON::ParserError => e
+      Rails.logger.error("CustomSSO: failed to parse profile data: #{e.message}")
+      render plain: "数据解析失败，请重新登录", status: 400
+      return
+    end
+
+    # 从表单获取用户输入
+    submitted_username = params[:username].to_s.strip
+    submitted_name     = params[:name].to_s.strip
+    email              = params[:email].to_s.strip.downcase
+    password           = params[:password].to_s
+
+    # ── 验证用户名 ────────────────────────────────────────
+    if submitted_username.blank?
+      render html: complete_profile_html(submitted_username, submitted_name, email, "请输入用户名", profile_token).html_safe, layout: false
+      return
+    end
+
+    # 规范化用户名（去除空格、特殊字符等）
+    normalized_username = normalize_username(submitted_username)
+    
+    # 检查规范化后的用户名是否有效
+    if normalized_username.blank? || normalized_username == "user"
+      render html: complete_profile_html(submitted_username, submitted_name, email, "用户名无效，请使用字母、数字、下划线或点号", profile_token).html_safe, layout: false
+      return
+    end
+
+    if normalized_username.length < 3
+      render html: complete_profile_html(submitted_username, submitted_name, email, "用户名长度至少 3 位", profile_token).html_safe, layout: false
+      return
+    end
+
+    # 如果规范化后的用户名与原输入不同，提示用户（但允许继续）
+    if normalized_username != submitted_username.strip
+      Rails.logger.info("CustomSSO: username normalized from '#{submitted_username}' to '#{normalized_username}'")
+    end
+
+    # ── 验证邮箱 ──────────────────────────────────────────
     if email.blank? || !email.match?(/\A[^@\s]+@[^@\s]+\.[^@\s]+\z/)
-      render html: complete_profile_html(username, name, email, "请输入有效的邮箱地址").html_safe, layout: false
+      render html: complete_profile_html(submitted_username, submitted_name, email, "请输入有效的邮箱地址", profile_token).html_safe, layout: false
       return
     end
 
+    # ── 验证密码 ──────────────────────────────────────────
     if password.length < 8
-      render html: complete_profile_html(username, name, email, "密码长度至少 8 位").html_safe, layout: false
+      render html: complete_profile_html(submitted_username, submitted_name, email, "密码长度至少 8 位", profile_token).html_safe, layout: false
+      return
+    end
+
+    # ── 检查用户名和邮箱是否已存在 ────────────────────────
+    if User.exists?(username: normalized_username)
+      render html: complete_profile_html(submitted_username, submitted_name, email, "该用户名已被使用，请选择其他用户名", profile_token).html_safe, layout: false
       return
     end
 
     if User.exists?(email: email)
-      render html: complete_profile_html(username, name, email, "该邮箱已被其他用户使用").html_safe, layout: false
+      render html: complete_profile_html(submitted_username, submitted_name, email, "该邮箱已被其他用户使用", profile_token).html_safe, layout: false
       return
     end
 
     # ── 创建用户 ──────────────────────────────────────────
-    final_username = ensure_unique_username(username)
+    final_username = normalized_username
 
     begin
+      # 使用表单提交的显示名称，如果为空则使用用户名
+      display_name = submitted_name.present? ? submitted_name : final_username
+      
       user = User.create!(
         email:                 email,
         username:              final_username,
-        name:                  name.present? ? name.to_s : final_username,
+        name:                  display_name,
         password:              password,
         password_confirmation: password,
         active:                true,
         approved:              true
       )
 
-      Rails.logger.info("CustomSSO: created new user — id=#{user.id}, email=#{email}, username=#{final_username}")
+      Rails.logger.info("CustomSSO: created new user — id=#{user.id}, email=#{email}, username=#{final_username}, name=#{display_name}")
 
-      # 清除 session 中的临时数据
-      session.delete(:sso_pending_username)
-      session.delete(:sso_pending_name)
-      session.delete(:sso_pending_email)
+      # 清除 Redis 中的临时数据
+      Discourse.redis.del(redis_key)
+      Rails.logger.info("CustomSSO: deleted profile data from Redis — key=#{redis_key}")
 
       log_on_user(user)
       redirect_to "#{discourse_base}/", allow_other_host: true
     rescue => e
       Rails.logger.error("CustomSSO: failed to create user: #{e.class} #{e.message}")
-      render html: complete_profile_html(username, name, email, "创建用户失败: #{e.message}").html_safe, layout: false
+      render html: complete_profile_html(submitted_username, submitted_name, email, "创建用户失败: #{e.message}", profile_token).html_safe, layout: false
     end
   end
 
@@ -488,7 +575,7 @@ class CustomSsoController < ::ApplicationController
   end
 
   # ── 补全信息页面 HTML ──────────────────────────────────
-  def complete_profile_html(username, name, email, error_msg = nil)
+  def complete_profile_html(username, name, email, error_msg = nil, token = nil)
     base_url = discourse_base
     <<~HTML
       <!DOCTYPE html>
@@ -592,14 +679,17 @@ class CustomSsoController < ::ApplicationController
           #{error_msg ? "<div class=\"error-msg\">#{ERB::Util.html_escape(error_msg)}</div>" : ""}
 
           <form method="POST" action="#{base_url}/custom-sso/create-account">
+            #{token ? "<input type=\"hidden\" name=\"token\" value=\"#{ERB::Util.html_escape(token)}\" />" : ""}
             <div class="field">
-              <label>用户名</label>
-              <input type="text" value="#{ERB::Util.html_escape(username)}" readonly />
+              <label>用户名 <span style="color:#dc2626">*</span></label>
+              <input type="text" name="username" value="#{ERB::Util.html_escape(username)}" 
+                     placeholder="只能包含字母、数字、下划线和点号" required />
             </div>
 
             <div class="field">
               <label>显示名称</label>
-              <input type="text" value="#{ERB::Util.html_escape(name)}" readonly />
+              <input type="text" name="name" value="#{ERB::Util.html_escape(name)}" 
+                     placeholder="可选，用于显示" />
             </div>
 
             <div class="field">
