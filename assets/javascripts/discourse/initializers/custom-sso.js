@@ -53,11 +53,17 @@ export default {
         btn.className = "btn btn-primary custom-sso-btn";
         btn.type = "button";
         btn.textContent = "统一身份认证";
+        // 添加明确的标识，避免与原生登录按钮混淆
+        btn.setAttribute("data-custom-sso", "true");
+        btn.style.marginBottom = "10px"; // 添加间距，与原生按钮区分
 
         btn.addEventListener("click", (e) => {
           e.preventDefault();
           e.stopPropagation();
 
+          // eslint-disable-next-line no-console
+          console.log("[custom-sso] 用户点击了统一身份认证按钮，跳转到 SSO 登录");
+          
           // 跳转到 /custom-sso/login，后端会直接构造 OAuth authorize URL
           // 跳转到认证中心。如果用户未登录，认证中心会展示登录页面；
           // 登录成功后认证中心带 code 回调到 /custom-sso/callback，
@@ -72,7 +78,7 @@ export default {
         container.prepend(btn);
 
         // eslint-disable-next-line no-console
-        console.log("[custom-sso] button inserted");
+        console.log("[custom-sso] button inserted - 注意：此按钮仅用于统一身份认证，不影响原生登录/注册功能");
       }
 
       // SPA 路由切到 /login 时，尝试插一次
