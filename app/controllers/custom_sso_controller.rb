@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # 注意：类名必须是 CustomSsoController（顶层命名空间），
-# 这样 Rails 路由 "custom_sso#login" 才能正确匹配到这个控制器。
+# 这样 Rails 路由 "custom_sso#authorize" 才能正确匹配到这个控制器。
 class CustomSsoController < ::ApplicationController
   requires_plugin "custom-sso"
 
@@ -26,87 +26,46 @@ class CustomSsoController < ::ApplicationController
   skip_before_action :check_restricted_access,     raise: false
   skip_before_action :block_if_maintenance_mode,   raise: false
 
-  # ── 关键：清除 session 中的 destination_url ──────────
-  # Discourse 的 ApplicationController 会自动把当前请求 URL 存到
-  # session["destination_url"]，这样用户登录后会跳转回来。
-  # 但 /custom-sso/login 和 /custom-sso/callback 是 SSO 流程的中间页面，
-  # 不应该被当作"用户想回去的页面"。
-  # 如果不清除，用户点了"统一身份认证"但没完成 SSO，回去用原生方式登录时，
-  # Discourse 会把他跳转到 /custom-sso/login，导致两套登录流程互相干扰。
-  before_action :_clear_destination_url
-
   # 允许匿名访问（Discourse 内部检查）
   def self.allows_anonymous?
     true
   end
 
   # ──────────────────────────────────────────────────────────
-  # 1️⃣  GET /custom-sso/login
+  # 1️⃣  GET /custom-sso/authorize
   #
-  #    Discourse 登录页上的「统一身份认证」按钮会跳到这里。
+  #    Discourse 页面上的「统一身份认证」按钮会跳到这里。
   #    直接构造 OAuth 2.0 Authorization Code 请求，
   #    跳转到认证中心的 authorize 端点。
   #
-  #    如果用户未在认证中心登录，认证中心会自动展示登录页面；
-  #    登录成功后认证中心会带 code 回调到 /custom-sso/callback。
-  #    全程不经过门户 portal 页面。
+  #    路由名称故意避开 "login"！
+  #    Discourse 的 ApplicationController 会把包含 "login" 的 URL
+  #    存入 session["destination_url"]，原生登录成功后会跳转到那个 URL。
+  #    如果 SSO 入口叫 /custom-sso/login，原生登录就会被错误地跳转到
+  #    SSO 流程，导致两套登录互相干扰。
   # ──────────────────────────────────────────────────────────
-  def login
-    Rails.logger.info("CustomSSO: ========== login action entered ==========")
+  def authorize
+    Rails.logger.info("CustomSSO: ========== authorize action entered ==========")
     Rails.logger.info("CustomSSO: request method=#{request.method}, format=#{request.format}")
     Rails.logger.info("CustomSSO: request url=#{request.original_url}")
     Rails.logger.info("CustomSSO: current_user=#{current_user&.username || 'anonymous'}")
-    Rails.logger.info("CustomSSO: referer=#{request.referer}")
-    Rails.logger.info("CustomSSO: params=#{params.inspect}")
-    
+
     # ── 检查插件是否启用 ──────────────────────────────────
     unless SiteSetting.custom_sso_enabled
       Rails.logger.error("CustomSSO: Plugin is disabled! Check custom_sso_enabled setting.")
       render plain: "Custom SSO 插件未启用，请在后台设置中启用 custom_sso_enabled", status: 403
       return
     end
-    
-    # ── 关键保护：处理非 GET 请求 ────────
-    # 原生登录表单提交是 POST 请求，不应该到达这里
-    # 如果收到 POST 请求，可能是：
-    # 1. Discourse 原生登录表单被错误地提交到这里
-    # 2. Discourse 登录成功后把 /custom-sso/login 作为 return_path，导致重定向到这里
-    # 3. 其他插件或中间件拦截了请求
-    if request.method != "GET"
-      Rails.logger.warn("CustomSSO: login action received non-GET request (#{request.method})")
-      Rails.logger.warn("CustomSSO: current_user=#{current_user&.username || 'anonymous'}")
-      Rails.logger.warn("CustomSSO: referer=#{request.referer}")
-      Rails.logger.warn("CustomSSO: params=#{params.inspect}")
-      
-      # 如果用户已经登录，说明可能是 Discourse 登录成功后的重定向
-      # 这种情况下应该重定向到首页，而不是返回错误
-      if current_user
-        Rails.logger.info("CustomSSO: POST request received but user already logged in as #{current_user.username}; redirecting to home")
-        redirect_to "#{discourse_base}/", allow_other_host: true, status: 302
-        return
-      end
-      
-      # 如果用户未登录，说明可能是表单被错误提交到这里
-      Rails.logger.error("CustomSSO: POST request received but user not logged in!")
-      Rails.logger.error("CustomSSO: Possible causes:")
-      Rails.logger.error("CustomSSO:   1. Login form action was modified by another plugin")
-      Rails.logger.error("CustomSSO:   2. Discourse SSO settings conflict with custom SSO")
-      Rails.logger.error("CustomSSO:   3. Middleware or route matching issue")
-      Rails.logger.error("CustomSSO: Check Discourse admin settings for SSO-related configurations")
-      # 返回 405 Method Not Allowed
-      head :method_not_allowed
-      return
-    end
-    
+
     # ── 输出配置状态（用于诊断）────────────────────────────
     Rails.logger.info("CustomSSO: Configuration check:")
     Rails.logger.info("CustomSSO:   custom_sso_enabled=#{SiteSetting.custom_sso_enabled}")
     Rails.logger.info("CustomSSO:   custom_sso_authorize_url=#{SiteSetting.custom_sso_authorize_url.present? ? 'configured' : 'NOT CONFIGURED'}")
     Rails.logger.info("CustomSSO:   custom_sso_client_id=#{SiteSetting.custom_sso_client_id.present? ? 'configured' : 'NOT CONFIGURED'}")
     Rails.logger.info("CustomSSO:   custom_sso_discourse_base_url=#{SiteSetting.custom_sso_discourse_base_url.present? ? SiteSetting.custom_sso_discourse_base_url : 'using default'}")
-    
+
     # 如果用户已经登录：
-    # - 默认不强制登出（否则一旦 Discourse 把 return-to 设成 /custom-sso/login，会造成“原生登录成功又被踢出”的体验）
+    # - 默认不强制登出
     # - 只有显式带参数才允许切换账号走 SSO
     if current_user
       force = ActiveModel::Type::Boolean.new.cast(params[:force]) ||
@@ -115,7 +74,7 @@ class CustomSsoController < ::ApplicationController
 
       unless force
         Rails.logger.warn(
-          "CustomSSO: /custom-sso/login visited while already logged in as #{current_user.username}; " \
+          "CustomSSO: /custom-sso/authorize visited while already logged in as #{current_user.username}; " \
           "redirecting to home (no forced logout). Pass ?force=1 to switch account via SSO."
         )
         redirect_to "#{discourse_base}/", allow_other_host: true, status: 302
@@ -126,7 +85,7 @@ class CustomSsoController < ::ApplicationController
       log_off_user
       Rails.logger.info("CustomSSO: user logged out, proceeding with SSO login")
     end
-    
+
     authorize_url = SiteSetting.custom_sso_authorize_url.to_s.strip
     client_id     = SiteSetting.custom_sso_client_id.to_s.strip
     callback_url  = "#{discourse_base}/custom-sso/callback"
@@ -148,29 +107,28 @@ class CustomSsoController < ::ApplicationController
     # 生成 state 和 nonce（OpenID Connect 标准参数）
     state = SecureRandom.hex(16)
     nonce = SecureRandom.hex(16)
-    
+
     # 使用 Redis 存储 state 和 nonce（避免跨域重定向导致 session 丢失）
     # 设置 10 分钟过期时间
     redis_key = "custom_sso_state:#{state}"
     redis_data = { nonce: nonce, created_at: Time.now.to_i }.to_json
     Discourse.redis.setex(redis_key, 600, redis_data) # 600 秒 = 10 分钟
 
-    Rails.logger.info("CustomSSO: login — discourse_base=#{discourse_base}, callback_url=#{callback_url}")
+    Rails.logger.info("CustomSSO: authorize — discourse_base=#{discourse_base}, callback_url=#{callback_url}")
     Rails.logger.info("CustomSSO: state=#{state}, nonce=#{nonce}")
     Rails.logger.info("CustomSSO: saved state to Redis with key=#{redis_key}")
 
     # 使用 URI 构建器确保 URL 格式正确
-    # 这样可以正确处理已有查询参数，避免重复
     uri = URI.parse(authorize_url)
     query_params = {}
-    
+
     # 解析已有查询参数
     if uri.query.present?
       URI.decode_www_form(uri.query).each do |key, value|
         query_params[key] = value
       end
     end
-    
+
     # 添加/覆盖 OAuth 参数
     query_params["response_type"] = "code"
     query_params["client_id"] = client_id
@@ -178,12 +136,12 @@ class CustomSsoController < ::ApplicationController
     query_params["redirect_uri"] = callback_url
     query_params["state"] = state
     query_params["nonce"] = nonce
-    
+
     uri.query = URI.encode_www_form(query_params)
     full_url = uri.to_s
 
-    Rails.logger.info("CustomSSO: login action — redirecting to OAuth authorize: #{full_url}")
-    
+    Rails.logger.info("CustomSSO: authorize action — redirecting to OAuth authorize: #{full_url}")
+
     # 使用 302 重定向，确保浏览器正确处理 cookie 和 session
     redirect_to full_url, allow_other_host: true, status: 302
   end
@@ -225,35 +183,34 @@ class CustomSsoController < ::ApplicationController
     end
 
     # 验证 state（防止 CSRF 攻击）
-    # 从 Redis 中读取 state（避免跨域重定向导致 session 丢失）
     if state.blank?
       Rails.logger.error("CustomSSO: state is blank in callback")
       render plain: "授权状态验证失败：回调中缺少 state 参数，请重新登录", status: 400
       return
     end
-    
+
     redis_key = "custom_sso_state:#{state}"
     redis_data = Discourse.redis.get(redis_key)
-    
+
     if redis_data.blank?
       Rails.logger.error("CustomSSO: state not found in Redis — key=#{redis_key}, state may be expired or invalid")
       render plain: "授权状态验证失败：state 已过期或无效，请重新登录", status: 400
       return
     end
-    
+
     begin
       state_info = JSON.parse(redis_data)
       expected_nonce = state_info["nonce"]
       Rails.logger.info("CustomSSO: state validation — found in Redis, nonce=#{expected_nonce}")
-      
+
       # 验证 nonce（如果回调中提供了 nonce）
       if nonce.present? && expected_nonce.present? && nonce != expected_nonce
         Rails.logger.error("CustomSSO: nonce mismatch — expected=#{expected_nonce}, got=#{nonce}")
-        Discourse.redis.del(redis_key) # 删除已使用的 state
+        Discourse.redis.del(redis_key)
         render plain: "授权状态验证失败：nonce 不匹配，请重新登录", status: 400
         return
       end
-      
+
       # 验证成功，删除 Redis 中的 state（一次性使用）
       Discourse.redis.del(redis_key)
       Rails.logger.info("CustomSSO: state validated successfully, removed from Redis")
@@ -278,9 +235,6 @@ class CustomSsoController < ::ApplicationController
       access_token = exchange_code_for_token(code, token_url)
 
       # ── 优先从 JWT access_token 中解析用户信息 ──────────
-      # Spring Authorization Server 的 access_token 是 JWT，
-      # 包含 sub, account, realName, userId, authorities 等 claims。
-      # /userinfo 端点可能只返回 sub，信息不全，所以优先用 JWT。
       jwt_claims = decode_jwt_payload(access_token)
       Rails.logger.info("CustomSSO: JWT claims: #{jwt_claims.inspect}")
 
@@ -342,8 +296,6 @@ class CustomSsoController < ::ApplicationController
       # ── 新用户：首次登录，需要补全邮箱和设置密码 ────────
       Rails.logger.info("CustomSSO: new user detected — username=#{normalized_username}, redirecting to complete profile")
 
-      # 使用 Redis 存储临时用户信息（避免跨域重定向导致 session 丢失）
-      # 生成一个唯一的 token，用于后续页面获取用户信息
       profile_token = SecureRandom.hex(32)
       redis_key = "custom_sso_profile:#{profile_token}"
       profile_data = {
@@ -351,10 +303,10 @@ class CustomSsoController < ::ApplicationController
         name: name.to_s.presence || normalized_username,
         email: email.to_s.strip.downcase
       }.to_json
-      
+
       # 设置 15 分钟过期时间（足够用户填写表单）
-      Discourse.redis.setex(redis_key, 900, profile_data) # 900 秒 = 15 分钟
-      
+      Discourse.redis.setex(redis_key, 900, profile_data)
+
       Rails.logger.info("CustomSSO: saved profile data to Redis with key=#{redis_key}")
 
       redirect_to "/custom-sso/complete-profile?token=#{profile_token}"
@@ -369,7 +321,7 @@ class CustomSsoController < ::ApplicationController
   # ──────────────────────────────────────────────────────────
   def complete_profile
     profile_token = params[:token].to_s.strip
-    
+
     if profile_token.blank?
       Rails.logger.error("CustomSSO: complete_profile missing token param")
       redirect_to "/login"
@@ -379,7 +331,7 @@ class CustomSsoController < ::ApplicationController
     # 从 Redis 中读取用户信息
     redis_key = "custom_sso_profile:#{profile_token}"
     redis_data = Discourse.redis.get(redis_key)
-    
+
     if redis_data.blank?
       Rails.logger.error("CustomSSO: profile token not found in Redis — key=#{redis_key}, token may be expired or invalid")
       redirect_to "/login"
@@ -391,10 +343,9 @@ class CustomSsoController < ::ApplicationController
       username = profile_data["username"]
       name     = profile_data["name"] || username
       email    = profile_data["email"] || ""
-      
+
       Rails.logger.info("CustomSSO: loaded profile data from Redis — username=#{username}")
-      
-      # 将 token 传递给表单，以便 create_account 使用
+
       render html: complete_profile_html(username, name, email, nil, profile_token).html_safe, layout: false
     rescue JSON::ParserError => e
       Rails.logger.error("CustomSSO: failed to parse profile data: #{e.message}")
@@ -413,7 +364,7 @@ class CustomSsoController < ::ApplicationController
     username = nil
     name = nil
     email = nil
-    
+
     begin
       if profile_token.blank?
         render plain: "缺少验证令牌，请重新登录", status: 400
@@ -423,7 +374,7 @@ class CustomSsoController < ::ApplicationController
       # 从 Redis 中读取用户信息
       redis_key = "custom_sso_profile:#{profile_token}"
       redis_data = Discourse.redis.get(redis_key)
-      
+
       if redis_data.blank?
         render plain: "验证令牌已过期或无效，请重新登录", status: 400
         return
@@ -457,7 +408,7 @@ class CustomSsoController < ::ApplicationController
         render html: complete_profile_html(username, name, email, "密码过长", profile_token).html_safe, layout: false
         return
       end
-      
+
       if password.length < 8
         render html: complete_profile_html(username, name, email, "密码长度至少 8 位", profile_token).html_safe, layout: false
         return
@@ -470,16 +421,14 @@ class CustomSsoController < ::ApplicationController
       end
 
       # ── 检查用户名冲突（参考官方源码） ────────────────────
-      # 检查是否与现有路由冲突
       begin
         Discourse::Application.routes.recognize_path("/#{final_username}")
-        # 如果能识别路由，说明有冲突
         render html: complete_profile_html(username, name, email, "该用户名与现有路由冲突", profile_token).html_safe, layout: false
         return
       rescue
         # 如果抛出异常，说明没有路由冲突，继续
       end
-      
+
       if User.reserved_username?(final_username)
         render html: complete_profile_html(username, name, email, "该用户名已被保留", profile_token).html_safe, layout: false
         return
@@ -487,84 +436,79 @@ class CustomSsoController < ::ApplicationController
 
       # ── 创建用户（参考 Discourse 官方源码） ────────────────
       Rails.logger.info("CustomSSO: attempting to create user — email=#{email}, username=#{final_username}, name=#{name}")
-      
-      # 准备用户参数（参考官方源码）
+
       new_user_params = {
         email: email.strip.downcase,
         username: final_username,
         name: name
       }
-      
+
       # 检查是否存在 staged user（临时用户）
       user = User.where(staged: true).with_email(new_user_params[:email]).first
-      
+
       if user
-        # 如果存在 staged user，取消 staged 状态并激活
         user.active = false
         user.unstage!
         Rails.logger.info("CustomSSO: found staged user, unstaging — id=#{user.id}")
       else
-        # 创建新用户
         user = User.new
         Rails.logger.info("CustomSSO: creating new user")
       end
-      
+
       # 设置用户属性
       user.attributes = new_user_params
-      
+
       # 设置密码（如果提供）
       if password.present?
         user.password = password
       end
-      
-      # SSO 用户默认设置为 active 和 approved（参考官方源码逻辑）
+
+      # SSO 用户默认设置为 active 和 approved
       user.active = true
-      
-      # 自动批准用户（参考官方源码）
+
+      # 自动批准用户
       if user.approved? || EmailValidator.can_auto_approve_user?(user.email)
         ReviewableUser.set_approved_fields!(user, nil)
         Rails.logger.info("CustomSSO: auto-approved user based on email domain")
       end
-      
-      # 使用 UserAuthenticator 处理认证（参考官方源码）
+
+      # 使用 UserAuthenticator 处理认证
       authentication = UserAuthenticator.new(user, session)
       authentication.start
-      
+
       if authentication.email_valid? && !authentication.authenticated?
         Rails.logger.error("CustomSSO: authentication failed — email_valid=#{authentication.email_valid?}, authenticated=#{authentication.authenticated?}")
         render html: complete_profile_html(username, name, email, "认证失败", profile_token).html_safe, layout: false
         return
       end
-      
-      # 使用 UserActivator 处理激活（参考官方源码）
+
+      # 使用 UserActivator 处理激活
       activation = UserActivator.new(user, request, session, cookies)
       activation.start
-      
+
       # 保存用户
       if user.save
         authentication.finish
         activation.finish
-        
+
         Rails.logger.info("CustomSSO: user saved successfully — id=#{user.id}, email=#{email}, username=#{final_username}")
-        
-        # 如果用户被创建为 active，激活用户（参考官方源码）
+
         if user.active?
           user.activate
           Rails.logger.info("CustomSSO: user activated — id=#{user.id}")
         end
       else
-        # 处理保存失败
         errors = user.errors.to_hash
         errors[:email] = errors.delete(:primary_email) if errors[:primary_email]
         error_message = user.errors.full_messages.join(", ")
-        
+
         Rails.logger.error("CustomSSO: failed to save user — #{error_message}")
         Rails.logger.error("CustomSSO: user errors: #{errors.inspect}")
-        
+
         render html: complete_profile_html(username, name, email, "创建用户失败: #{error_message}", profile_token).html_safe, layout: false
         return
       end
-      
+
       Rails.logger.info("CustomSSO: created new user — id=#{user.id}, email=#{email}, username=#{final_username}, name=#{name}")
 
       # 清除 Redis 中的临时数据
@@ -575,7 +519,7 @@ class CustomSsoController < ::ApplicationController
       Rails.logger.info("CustomSSO: attempting to log in user...")
       log_on_user(user)
       Rails.logger.info("CustomSSO: user logged in automatically after account creation — username=#{final_username}")
-      
+
       Rails.logger.info("CustomSSO: redirecting to #{discourse_base}/")
       redirect_to "#{discourse_base}/", allow_other_host: true
     rescue => e
@@ -592,17 +536,6 @@ class CustomSsoController < ::ApplicationController
   end
 
   private
-
-  # ── 清除 destination_url ────────────────────────────────
-  # 只要请求进入了 CustomSsoController，就把 session["destination_url"] 清掉。
-  # 这样原生登录流程就不会被 /custom-sso/* 的 URL 污染。
-  def _clear_destination_url
-    dest = session["destination_url"].to_s
-    if dest.include?("/custom-sso/")
-      Rails.logger.info("[CustomSSO] Clearing destination_url from session: #{dest}")
-      session.delete("destination_url")
-    end
-  end
 
   # ── 辅助方法 ────────────────────────────────────────────
 
@@ -627,7 +560,6 @@ class CustomSsoController < ::ApplicationController
       request.content_type = "application/x-www-form-urlencoded"
 
       # Spring Authorization Server 默认使用 client_secret_basic 认证方式
-      # 即通过 HTTP Basic Auth 传递 client_id 和 client_secret
       request.basic_auth(client_id, client_secret)
 
       request.set_form_data(
@@ -663,15 +595,11 @@ class CustomSsoController < ::ApplicationController
   end
 
   # 解析 JWT 的 payload 部分（不验证签名，仅提取 claims）
-  # Spring Authorization Server 的 access_token 是 JWT，
-  # 包含 sub, account, realName, userId 等自定义 claims
   def decode_jwt_payload(token)
     parts = token.to_s.split(".")
     return {} unless parts.length == 3
 
-    # JWT payload 是 Base64url 编码的
     payload_b64 = parts[1]
-    # 补齐 Base64 padding
     payload_b64 += "=" * (4 - payload_b64.length % 4) if payload_b64.length % 4 != 0
     payload_json = Base64.urlsafe_decode64(payload_b64)
     JSON.parse(payload_json)
