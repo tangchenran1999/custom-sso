@@ -48,6 +48,14 @@ class CustomSsoController < ::ApplicationController
     Rails.logger.info("CustomSSO: request url=#{request.original_url}")
     Rails.logger.info("CustomSSO: current_user=#{current_user&.username || 'anonymous'}")
     
+    # ── 关键保护：只接受 GET 请求，拒绝 POST 请求 ────────
+    # 原生登录表单提交是 POST 请求，不应该到达这里
+    if request.method != "GET"
+      Rails.logger.error("CustomSSO: login action received non-GET request (#{request.method}), redirecting to /login")
+      redirect_to "/login", status: 302
+      return
+    end
+    
     # 如果用户已经登录，先登出，然后再进行 SSO 登录
     if current_user
       Rails.logger.info("CustomSSO: user already logged in (#{current_user.username}), logging out first")
