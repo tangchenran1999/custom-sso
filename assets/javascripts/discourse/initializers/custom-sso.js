@@ -8,6 +8,39 @@ export default {
       // eslint-disable-next-line no-console
       console.log("[custom-sso] initializer loaded");
 
+      // ── 防止原生登录成功后回跳到 /custom-sso/login ─────────
+      // 有些情况下（例如之前访问过 /custom-sso/login），Discourse 会把它保存成登录后的 redirect/return_path。
+      // 用户选择“原生登录”时，这会导致登录成功后又被带回 /custom-sso/login。
+      // 这里在 /login 页面把这种 redirect 参数改写成 "/"，避免回跳。
+      if (window.location.pathname === "/login") {
+        try {
+          const u = new URL(window.location.href);
+          const keys = ["redirect", "return_path", "destination_url"];
+          let changed = false;
+
+          keys.forEach((k) => {
+            const v = u.searchParams.get(k);
+            if (v && v.includes("/custom-sso/login")) {
+              u.searchParams.set(k, "/");
+              changed = true;
+            }
+          });
+
+          if (changed) {
+            const next =
+              u.pathname +
+              (u.searchParams.toString() ? `?${u.searchParams.toString()}` : "") +
+              u.hash;
+            window.history.replaceState({}, document.title, next);
+            // eslint-disable-next-line no-console
+            console.warn("[custom-sso] detected bad login redirect to /custom-sso/login; rewrote to /");
+          }
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn("[custom-sso] failed to sanitize login redirect params", e);
+        }
+      }
+
       // ── 关键修复：如果当前 URL 是 /custom-sso/* 后端路由，
       //    说明 Discourse 的 Ember SPA 错误地拦截了本应由 Rails 处理的请求。
       //    这种情况下 Ember 会尝试用 AJAX 请求该 URL，导致 403。
