@@ -1,5 +1,68 @@
 import { withPluginApi } from "discourse/lib/plugin-api";
 
+// ══════════════════════════════════════════════════════════════════
+// 🔒 最早期拦截：在 Discourse Ember 路由器之前拦截 history API
+//    防止登录成功后 Ember 通过 pushState 导航到 /custom-sso/login
+//    这段代码必须在模块加载时立即执行（不能等 withPluginApi 回调）
+// ══════════════════════════════════════════════════════════════════
+(function earlyIntercept() {
+  // 检查 URL 是否指向 /custom-sso/login（不含 callback 等其他路由）
+  function isBadSsoRedirect(url) {
+    if (typeof url !== "string") {
+      return false;
+    }
+    try {
+      // 处理相对路径和绝对路径
+      const parsed = new URL(url, window.location.origin);
+      return parsed.pathname === "/custom-sso/login" || parsed.pathname.startsWith("/custom-sso/login?");
+    } catch (_) {
+      return url === "/custom-sso/login" || url.startsWith("/custom-sso/login?") || url.startsWith("/custom-sso/login#");
+    }
+  }
+
+  function fixUrl(url) {
+    if (typeof url !== "string") {
+      return url;
+    }
+    try {
+      const parsed = new URL(url, window.location.origin);
+      parsed.pathname = "/";
+      return parsed.pathname + parsed.search + parsed.hash;
+    } catch (_) {
+      return "/";
+    }
+  }
+
+  const _origPushState = history.pushState;
+  const _origReplaceState = history.replaceState;
+
+  history.pushState = function (state, title, url) {
+    if (isBadSsoRedirect(url)) {
+      // eslint-disable-next-line no-console
+      console.warn("[custom-sso][early] intercepted pushState to /custom-sso/login → rewriting to /");
+      url = fixUrl(url);
+    }
+    return _origPushState.call(this, state, title, url);
+  };
+
+  history.replaceState = function (state, title, url) {
+    if (isBadSsoRedirect(url)) {
+      // eslint-disable-next-line no-console
+      console.warn("[custom-sso][early] intercepted replaceState to /custom-sso/login → rewriting to /");
+      url = fixUrl(url);
+    }
+    return _origReplaceState.call(this, state, title, url);
+  };
+
+  // 如果页面已经在 /custom-sso/login 上（例如硬刷新或直接访问）
+  // 且 Discourse 的 session cookie 存在（说明用户已登录），直接跳首页
+  if (window.location.pathname === "/custom-sso/login" && document.cookie.includes("_t=")) {
+    // eslint-disable-next-line no-console
+    console.warn("[custom-sso][early] already on /custom-sso/login and logged in → redirecting to /");
+    window.location.replace("/");
+  }
+})();
+
 export default {
   name: "custom-sso",
 
@@ -60,16 +123,16 @@ export default {
       }, 100);
 
       // ── 关键修复：如果当前 URL 是 /custom-sso/* 后端路由，
-      //    说明 Discourse 的 Ember SPA 错误地拦截了本应由 Rails 处理的请求。
-      //    这种情况下 Ember 会尝试用 AJAX 请求该 URL，导致 403。
-      //    解决方案：检测到这种情况后，强制用完整页面导航重新请求。
+      //    需要区分两种情况：
+      //    A) 用户已登录 → 直接跳首页（不要再走 SSO 流程）
+      //    B) 用户未登录 → 强制全页面刷新让 Rails 处理
       const path = window.location.pathname;
       if (
-        path.startsWith("/custom-sso/login") ||
         path.startsWith("/custom-sso/callback") ||
         path.startsWith("/custom-sso/complete-profile") ||
         path.startsWith("/custom-sso/create-account")
       ) {
+        // 这些路由始终需要后端处理
         // eslint-disable-next-line no-console
         console.log("[custom-sso] backend route detected, forcing full page navigation");
         if (!window.location.search.includes("_sso_reload=1")) {
@@ -80,58 +143,34 @@ export default {
         return;
       }
 
-      // ── 监听登录成功事件，防止跳转到 /custom-sso/login ────────
-      // Discourse 登录成功后可能会跳转到之前访问过的 URL
-      // 如果这个 URL 是 /custom-sso/login，我们需要拦截并重定向到首页
-      function interceptLoginSuccessRedirect() {
-        // 监听所有导航事件
-        const originalPushState = history.pushState;
-        const originalReplaceState = history.replaceState;
-        
-        function checkAndFixUrl(url) {
-          if (typeof url === 'string' && url.includes('/custom-sso/login')) {
-            // eslint-disable-next-line no-console
-            console.warn("[custom-sso] intercepted redirect to /custom-sso/login, redirecting to / instead");
-            return url.replace(/\/custom-sso\/login[^?]*/, '/').replace(/\/custom-sso\/login/, '/');
-          }
-          return url;
+      if (path === "/custom-sso/login" || path.startsWith("/custom-sso/login?")) {
+        // /custom-sso/login 需要特殊处理
+        if (document.cookie.includes("_t=")) {
+          // 用户已登录，直接跳首页（不要走 SSO 流程）
+          // eslint-disable-next-line no-console
+          console.warn("[custom-sso] on /custom-sso/login but already logged in → redirecting to /");
+          window.location.replace("/");
+          return;
         }
-        
-        history.pushState = function(...args) {
-          if (args[2]) {
-            args[2] = checkAndFixUrl(args[2]);
-          }
-          return originalPushState.apply(this, args);
-        };
-        
-        history.replaceState = function(...args) {
-          if (args[2]) {
-            args[2] = checkAndFixUrl(args[2]);
-          }
-          return originalReplaceState.apply(this, args);
-        };
-        
-        // 监听 popstate 事件（浏览器前进/后退）
-        window.addEventListener('popstate', () => {
-          if (window.location.pathname === '/custom-sso/login') {
-            // eslint-disable-next-line no-console
-            console.warn("[custom-sso] detected navigation to /custom-sso/login via popstate, redirecting to /");
-            window.location.replace('/');
-          }
-        });
-        
-        // 定期检查当前 URL（作为最后一道防线）
-        setInterval(() => {
-          if (window.location.pathname === '/custom-sso/login' && document.cookie.includes('_t=')) {
-            // 如果已经登录但还在 /custom-sso/login 页面，重定向到首页
-            // eslint-disable-next-line no-console
-            console.warn("[custom-sso] user is logged in but on /custom-sso/login page, redirecting to /");
-            window.location.replace('/');
-          }
-        }, 500);
+        // 用户未登录，强制全页面刷新让 Rails 处理 SSO
+        // eslint-disable-next-line no-console
+        console.log("[custom-sso] backend route /custom-sso/login detected, forcing full page navigation");
+        if (!window.location.search.includes("_sso_reload=1")) {
+          const sep = window.location.search ? "&" : "?";
+          window.location.href = window.location.href + sep + "_sso_reload=1";
+          return;
+        }
+        return;
       }
-      
-      interceptLoginSuccessRedirect();
+
+      // ── popstate 监听（浏览器前进/后退按钮）────────
+      window.addEventListener("popstate", () => {
+        if (window.location.pathname === "/custom-sso/login") {
+          // eslint-disable-next-line no-console
+          console.warn("[custom-sso] detected navigation to /custom-sso/login via popstate → redirecting to /");
+          window.location.replace("/");
+        }
+      });
 
       // ── 关键保护：确保原生登录表单不会被误拦截 ────────
       // 1. 主动修复登录表单的 action（如果被错误修改）
